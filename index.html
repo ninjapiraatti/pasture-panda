@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pasture Panda</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="container">
+      <h1>Pasture Panda</h1>
+      <p class="subtitle">Image Converter</p>
+
+      <div class="drop-zone" id="drop-zone">
+        <p>Drop images here or click to select</p>
+        <p class="formats-hint">PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, AVIF</p>
+      </div>
+
+      <div class="file-list-container" id="file-list-container" style="display: none;">
+        <div class="file-list-header">
+          <span id="file-count">0 files selected</span>
+          <button class="text-btn" id="clear-btn">Clear all</button>
+        </div>
+        <div class="file-list" id="file-list"></div>
+      </div>
+
+      <div class="conversion-options" id="conversion-options" style="display: none;">
+        <div class="option-row">
+          <label for="format-select">Output format</label>
+          <select id="format-select"></select>
+        </div>
+
+        <div class="option-row" id="quality-container">
+          <label for="quality-slider">Quality</label>
+          <div class="slider-container">
+            <input type="range" id="quality-slider" min="1" max="100" value="85" />
+            <span id="quality-value">85%</span>
+          </div>
+        </div>
+
+        <div class="option-row">
+          <label for="output-mode">Output</label>
+          <select id="output-mode">
+            <option value="same_folder">Same folder as original</option>
+            <option value="custom_folder">Custom folder</option>
+            <option value="replace_original">Replace original files</option>
+          </select>
+        </div>
+
+        <div class="option-row" id="folder-row" style="display: none;">
+          <label>Folder</label>
+          <div class="folder-select">
+            <span id="selected-folder" class="folder-path">None selected</span>
+            <button id="folder-select-btn" class="secondary-btn">Browse</button>
+          </div>
+        </div>
+
+        <button id="convert-btn" class="primary-btn">Convert</button>
+      </div>
+
+      <div class="status" id="status"></div>
+    </main>
+  </body>
+</html>
