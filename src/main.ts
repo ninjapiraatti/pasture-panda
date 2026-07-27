@@ -1,5 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, ask } from "@tauri-apps/plugin-dialog";
+
+const IMAGE_EXTENSIONS = [
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+  "ico",
+  "tiff",
+  "tif",
+  "avif",
+];
 
 interface ImageInfo {
   path: string;
@@ -84,6 +98,7 @@ async function init() {
     outputFormats = await invoke<OutputFormatInfo[]>("get_supported_output_formats");
     populateFormatSelect();
     setupEventListeners();
+    await setupDragDrop();
     updateUI();
   } catch (error) {
     console.error("Failed to initialize:", error);
@@ -98,14 +113,6 @@ function populateFormatSelect() {
 
 function setupEventListeners() {
   dropZone.addEventListener("click", selectFiles);
-  dropZone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    dropZone.classList.add("drag-over");
-  });
-  dropZone.addEventListener("dragleave", () => {
-    dropZone.classList.remove("drag-over");
-  });
-  dropZone.addEventListener("drop", handleDrop);
 
   formatSelect.addEventListener("change", updateQualityVisibility);
   qualitySlider.addEventListener("input", () => {
@@ -123,12 +130,7 @@ async function selectFiles() {
   try {
     const selected = await open({
       multiple: true,
-      filters: [
-        {
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "avif"],
-        },
-      ],
+      filters: [{ name: "Images", extensions: IMAGE_EXTENSIONS }],
     });
 
     if (selected) {
@@ -141,29 +143,34 @@ async function selectFiles() {
   }
 }
 
-async function handleDrop(e: DragEvent) {
-  e.preventDefault();
-  dropZone.classList.remove("drag-over");
+function isSupportedImage(path: string): boolean {
+  const match = /\.([^./\\]+)$/.exec(path);
+  return match !== null && IMAGE_EXTENSIONS.includes(match[1].toLowerCase());
+}
 
-  const files = e.dataTransfer?.files;
-  if (files && files.length > 0) {
-    const paths: string[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.type.startsWith("image/")) {
-        const path = (file as any).path;
-        if (path) {
-          paths.push(path);
-        }
+// The webview intercepts OS drops, so HTML5 drag events never reach us and a dropped
+// File carries no filesystem path. Tauri's own drag/drop event is the only source of
+// real paths, and it covers the whole window rather than just the drop zone.
+async function setupDragDrop() {
+  await getCurrentWebview().onDragDropEvent((event) => {
+    const payload = event.payload;
+
+    if (payload.type === "enter" || payload.type === "over") {
+      dropZone.classList.add("drag-over");
+      return;
+    }
+
+    dropZone.classList.remove("drag-over");
+
+    if (payload.type === "drop") {
+      const paths = payload.paths.filter(isSupportedImage);
+      if (paths.length > 0) {
+        void loadImages(paths);
+      } else if (payload.paths.length > 0) {
+        showStatus("No supported image files in that drop", "error");
       }
     }
-
-    if (paths.length > 0) {
-      await loadImages(paths);
-    } else {
-      showStatus("Drag & drop requires the built app. Use file picker in dev mode.", "error");
-    }
-  }
+  });
 }
 
 async function loadImages(paths: string[]) {

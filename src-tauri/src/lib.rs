@@ -1,8 +1,10 @@
 use image::{codecs::jpeg::JpegEncoder, codecs::webp::WebPEncoder, ImageFormat, ImageReader};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConversionResult {
@@ -46,8 +48,7 @@ pub enum OutputMode {
     ReplaceOriginal,
 }
 
-#[tauri::command]
-fn get_image_info(path: &str) -> Result<ImageInfo, String> {
+fn read_image_info(path: &str) -> Result<ImageInfo, String> {
     let img = image::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
 
     let metadata = fs::metadata(path).map_err(|e| format!("Failed to read metadata: {}", e))?;
@@ -76,11 +77,31 @@ fn get_image_info(path: &str) -> Result<ImageInfo, String> {
 }
 
 #[tauri::command]
-fn get_images_info(paths: Vec<String>) -> Vec<Result<ImageInfo, String>> {
-    paths.into_iter().map(|p| get_image_info(&p)).collect()
+async fn get_image_info(path: String) -> Result<ImageInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || read_image_info(&path))
+        .await
+        .map_err(|e| format!("Failed to read image info: {}", e))?
 }
 
-fn get_output_path(input_path: &str, options: &ConversionOptions) -> Result<String, String> {
+#[tauri::command]
+async fn get_images_info(paths: Vec<String>) -> Vec<Result<ImageInfo, String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.par_iter().map(|p| read_image_info(p)).collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Resolves the destination for one input.
+///
+/// `reserved` accumulates every destination handed out so far in this batch. Because
+/// conversion runs in parallel, `output_path.exists()` alone is no longer enough: two
+/// inputs planned at the same time would both see a free path and then race for it.
+fn get_output_path(
+    input_path: &str,
+    options: &ConversionOptions,
+    reserved: &mut HashSet<PathBuf>,
+) -> Result<String, String> {
     let input = Path::new(input_path);
     let stem = input
         .file_stem()
@@ -112,50 +133,67 @@ fn get_output_path(input_path: &str, options: &ConversionOptions) -> Result<Stri
         }
     };
 
+    let replacing = matches!(options.output_mode, OutputMode::ReplaceOriginal);
+
     // For replace mode with same format, we'll overwrite
-    if matches!(options.output_mode, OutputMode::ReplaceOriginal) {
+    let same_format_replace = replacing && {
         let input_ext = input
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
         let input_ext_normalized = if input_ext == "jpeg" { "jpg" } else { &input_ext };
+        input_ext_normalized == extension
+    };
 
-        if input_ext_normalized == extension {
-            return Ok(input_path.to_string());
+    let mut output_path = if same_format_replace {
+        input.to_path_buf()
+    } else {
+        output_dir.join(format!("{}.{}", stem, extension))
+    };
+
+    if replacing {
+        // Replace mode has no renaming to fall back on, so two inputs landing on the
+        // same destination would interleave their writes. Fail the second one instead.
+        if reserved.contains(&output_path) {
+            return Err(format!(
+                "Another file in this batch already writes to {}",
+                output_path.display()
+            ));
         }
-    }
-
-    let mut output_path = output_dir.join(format!("{}.{}", stem, extension));
-
-    // Avoid overwriting unless replace mode
-    if !matches!(options.output_mode, OutputMode::ReplaceOriginal) {
+    } else {
+        // Avoid overwriting anything on disk, or anything else in this batch.
         let mut counter = 1;
-        while output_path.exists() {
+        while output_path.exists() || reserved.contains(&output_path) {
             output_path = output_dir.join(format!("{}_{}.{}", stem, counter, extension));
             counter += 1;
         }
     }
 
-    output_path
+    let resolved = output_path
         .to_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| "Invalid output path".to_string())
+        .ok_or_else(|| "Invalid output path".to_string())?;
+
+    reserved.insert(output_path);
+    Ok(resolved)
 }
 
-fn convert_single_image(input_path: &str, options: &ConversionOptions) -> ConversionResult {
-    let output_path = match get_output_path(input_path, options) {
-        Ok(p) => p,
-        Err(e) => {
-            return ConversionResult {
-                success: false,
-                input_path: input_path.to_string(),
-                output_path: None,
-                error: Some(e),
-            }
-        }
-    };
+/// Reserves a destination for every input up front, single-threaded, so the parallel
+/// conversion pass never has to consult the filesystem to pick a name.
+fn plan_output_paths(paths: &[String], options: &ConversionOptions) -> Vec<Result<String, String>> {
+    let mut reserved = HashSet::new();
+    paths
+        .iter()
+        .map(|p| get_output_path(p, options, &mut reserved))
+        .collect()
+}
 
+fn convert_single_image(
+    input_path: &str,
+    output_path: String,
+    options: &ConversionOptions,
+) -> ConversionResult {
     let img = match ImageReader::open(input_path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())
@@ -234,11 +272,40 @@ fn convert_single_image(input_path: &str, options: &ConversionOptions) -> Conver
 }
 
 #[tauri::command]
-fn convert_images(paths: Vec<String>, options: ConversionOptions) -> BatchConversionResult {
-    let results: Vec<ConversionResult> = paths
-        .iter()
-        .map(|p| convert_single_image(p, &options))
-        .collect();
+async fn convert_images(paths: Vec<String>, options: ConversionOptions) -> BatchConversionResult {
+    // Destinations are reserved sequentially, then the decode/encode work — which is
+    // the expensive part — fans out across rayon's pool inside a blocking task, so the
+    // main thread stays free to keep the window responsive.
+    let planned = plan_output_paths(&paths, &options);
+    let inputs = paths.clone();
+
+    let results: Vec<ConversionResult> = tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .par_iter()
+            .zip(planned)
+            .map(|(input_path, planned)| match planned {
+                Ok(output_path) => convert_single_image(input_path, output_path, &options),
+                Err(error) => ConversionResult {
+                    success: false,
+                    input_path: input_path.clone(),
+                    output_path: None,
+                    error: Some(error),
+                },
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        inputs
+            .into_iter()
+            .map(|input_path| ConversionResult {
+                success: false,
+                input_path,
+                output_path: None,
+                error: Some(format!("Conversion task failed: {}", e)),
+            })
+            .collect()
+    });
 
     let succeeded = results.iter().filter(|r| r.success).count();
     let failed = results.len() - succeeded;
