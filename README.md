@@ -10,9 +10,9 @@ crate.
 ## Status
 
 Early, but no longer known to lose data. Conversions are written to a temporary file and
-renamed into place, so a failed encode can't destroy a source file. Remaining gaps are in
-[ISSUES.md](ISSUES.md): ICC profiles and EXIF metadata are still discarded (orientation
-*is* applied now), there's no progress bar or cancel, and no resize.
+renamed into place, so a failed encode can't destroy a source file. EXIF and ICC now survive
+conversion to JPEG, PNG and WebP. Remaining gaps are in [ISSUES.md](ISSUES.md): no resize, no
+HEIC input, and no progress bar or cancel.
 
 Testing is uneven and worth knowing about before you trust a change: `cargo test` covers
 the Rust conversion logic well, and nothing covers the running app. See
@@ -51,7 +51,10 @@ Tauri call fails — no file dialog, no conversion — so it is only useful for 
    removed individually.
 2. **Pick an output format** — PNG, JPEG, WebP, AVIF, GIF, BMP or TIFF.
 3. **Set quality** — the slider appears for JPEG and WebP.
-4. **Choose where output goes:**
+4. **Decide about metadata** — *Keep EXIF and colour profile* is on by default. Uncheck it to
+   strip capture date, GPS and camera data from the output. The checkbox disables itself for
+   formats that can't carry metadata (see below).
+5. **Choose where output goes:**
    - *Same folder as original* — writes alongside the input. Never overwrites: an existing
      `photo.webp` means the new file becomes `photo_1.webp`.
    - *Custom folder* — everything into one chosen directory, with the same collision-safe
@@ -60,7 +63,7 @@ Tauri call fails — no file dialog, no conversion — so it is only useful for 
      writes the new file and deletes the original when it changed. Asks for confirmation
      first. Still the destructive option, but a failed conversion now leaves the original
      untouched.
-5. **Convert** — the whole batch runs in one go, and the status line reports how many
+6. **Convert** — the whole batch runs in one go, and the status line reports how many
    succeeded.
 
 Files that can't be read are named in the status line rather than silently skipped.
@@ -81,13 +84,21 @@ app used to advertise AVIF input and then fail on it (issue 4).
 
 The quality slider applies to JPEG and WebP. For WebP, 100 means lossless.
 
+**Metadata** — EXIF and ICC profiles are carried into **JPEG, PNG and WebP** output, so capture
+date, GPS, camera data and colour profile survive. EXIF orientation is applied to the pixels and
+the stored tag reset, so photos come out upright without being double-rotated by viewers.
+
+GIF, BMP, TIFF and AVIF output do **not** carry metadata — TIFF and AVIF permit it in principle,
+but nothing here writes it. The UI disables the metadata checkbox and says so rather than
+dropping it silently. XMP and IPTC are not carried for any format.
+
 Remaining caveats:
 
-- **ICC profiles and EXIF metadata are dropped.** Capture date, GPS and camera data don't
-  survive, and wide-gamut images shift colour. EXIF *orientation* is applied, so photos come
-  out upright. Issue 7.
-- **No resize, and no HEIC support** — the two most conspicuous absences for a macOS image
+- **No resize, and no HEIC input** — the two most conspicuous absences for a macOS image
   tool. See the product notes in ISSUES.md.
+- **Preserved EXIF keeps its original stored dimensions.** After a rotation, the
+  `PixelXDimension`/`PixelYDimension` tags describe the pre-rotation image. Viewers use the
+  container dimensions, so this is cosmetic, but it is wrong in the file.
 
 ## Tests
 
@@ -95,10 +106,11 @@ Remaining caveats:
 cd src-tauri && cargo test
 ```
 
-20 tests covering the Rust side: output-path planning across all three output modes, batch
-collision handling, the atomic-write guarantee, and the WebP encoder. The most important one
-is `encode_failure_after_decode_leaves_the_original_intact`, which reproduces the old
-replace-mode data loss by feeding an image too wide for JPEG through the encoder.
+30 tests covering the Rust side: output-path planning across all three output modes, batch
+collision handling, the atomic-write guarantee, the WebP encoder, and EXIF/ICC preservation.
+The most important one is `encode_failure_after_decode_leaves_the_original_intact`, which
+reproduces the old replace-mode data loss by feeding an image too wide for JPEG through the
+encoder.
 
 **The running app has no automated coverage.** There's no frontend test tooling in the
 project, and Tauri's WebDriver support doesn't extend to macOS, so the UI, drag and drop,
@@ -127,9 +139,13 @@ interesting one is `convert_images`, which reserves every destination path up fr
 single-threaded (`plan_output_paths`) before fanning the encoding out in parallel — doing
 it in the other order races two inputs onto the same filename.
 
-Two invariants in `lib.rs` worth not breaking:
+Four invariants in `lib.rs` worth not breaking:
 
 - `convert_single_image` always encodes to a temp file and renames it into place. Writing
   straight to the destination is what used to destroy originals in replace mode.
 - `read_image_info` reports orientation-corrected dimensions, because `decode_oriented`
   rotates on decode. If one changes, the other has to.
+- `decode_oriented` clears the EXIF orientation tag on the metadata it carries forward. It
+  bakes the rotation into the pixels, so leaving the tag set makes viewers rotate a second time.
+- `move_png_exif_before_idat` exists because `img-parts` writes `eXIf` after `IDAT`, where most
+  decoders never look. Removing it makes PNG metadata silently unreadable.

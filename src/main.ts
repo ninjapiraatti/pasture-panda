@@ -29,6 +29,7 @@ interface OutputFormatInfo {
   name: string;
   extension: string;
   supports_quality: boolean;
+  supports_metadata: boolean;
 }
 
 interface ConversionOptions {
@@ -36,6 +37,7 @@ interface ConversionOptions {
   quality: number;
   output_mode: "same_folder" | "custom_folder" | "replace_original";
   output_folder: string | null;
+  preserve_metadata: boolean;
 }
 
 interface ConversionResult {
@@ -64,6 +66,8 @@ let formatSelect: HTMLSelectElement;
 let qualityContainer: HTMLElement;
 let qualitySlider: HTMLInputElement;
 let qualityValue: HTMLElement;
+let preserveMetadataCheckbox: HTMLInputElement;
+let metadataHint: HTMLElement;
 let outputModeSelect: HTMLSelectElement;
 let folderSelectBtn: HTMLElement;
 let selectedFolderEl: HTMLElement;
@@ -82,6 +86,8 @@ document.addEventListener("DOMContentLoaded", () => {
   qualityContainer = document.getElementById("quality-container")!;
   qualitySlider = document.getElementById("quality-slider") as HTMLInputElement;
   qualityValue = document.getElementById("quality-value")!;
+  preserveMetadataCheckbox = document.getElementById("preserve-metadata") as HTMLInputElement;
+  metadataHint = document.getElementById("metadata-hint")!;
   outputModeSelect = document.getElementById("output-mode") as HTMLSelectElement;
   folderSelectBtn = document.getElementById("folder-select-btn")!;
   selectedFolderEl = document.getElementById("selected-folder")!;
@@ -119,7 +125,10 @@ function populateFormatSelect() {
 function setupEventListeners() {
   dropZone.addEventListener("click", selectFiles);
 
-  formatSelect.addEventListener("change", updateQualityVisibility);
+  formatSelect.addEventListener("change", () => {
+    updateQualityVisibility();
+    updateMetadataAvailability();
+  });
   qualitySlider.addEventListener("input", () => {
     qualityValue.textContent = `${qualitySlider.value}%`;
   });
@@ -239,6 +248,7 @@ function updateUI() {
 
   renderFileList();
   updateQualityVisibility();
+  updateMetadataAvailability();
   updateFolderVisibility();
 }
 
@@ -290,6 +300,18 @@ function updateQualityVisibility() {
   qualityContainer.style.display = selectedFormat?.supports_quality ? "flex" : "none";
 }
 
+// Only JPEG, PNG and WebP output can carry EXIF/ICC. Rather than leave the checkbox looking
+// effective for formats where it does nothing, disable it and say why.
+function updateMetadataAvailability() {
+  const selectedFormat = outputFormats.find((f) => f.extension === formatSelect.value);
+  const supported = selectedFormat?.supports_metadata ?? false;
+
+  preserveMetadataCheckbox.disabled = !supported;
+  metadataHint.textContent = supported
+    ? ""
+    : `${selectedFormat?.name ?? "This format"} output cannot carry metadata`;
+}
+
 function updateFolderVisibility() {
   folderRow.style.display = outputModeSelect.value === "custom_folder" ? "flex" : "none";
 }
@@ -335,6 +357,8 @@ async function convertImages() {
     quality: parseInt(qualitySlider.value),
     output_mode: outputMode,
     output_folder: outputFolder,
+    // A disabled checkbox keeps its checked state, so gate on the format too.
+    preserve_metadata: preserveMetadataCheckbox.checked && !preserveMetadataCheckbox.disabled,
   };
 
   const paths = selectedImages.map((img) => img.path);

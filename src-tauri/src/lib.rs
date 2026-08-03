@@ -4,9 +4,8 @@ use image::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +40,14 @@ pub struct ConversionOptions {
     quality: u8,
     output_mode: OutputMode,
     output_folder: Option<String>,
+    /// Carry Exif/ICC from the source into the output where the container allows it.
+    /// Defaults to true so that stripping metadata is always a deliberate choice.
+    #[serde(default = "default_preserve_metadata")]
+    preserve_metadata: bool,
+}
+
+fn default_preserve_metadata() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -222,22 +229,123 @@ fn plan_output_paths(paths: &[String], options: &ConversionOptions) -> Vec<Resul
         .collect()
 }
 
-fn decode_oriented(input_path: &str) -> Result<image::DynamicImage, String> {
+/// Raw metadata blocks lifted off the source image, to be re-attached to the output.
+///
+/// Both are opaque byte blobs: `exif` is a TIFF-structured Exif block (starting with the
+/// `II*\0`/`MM\0*` byte-order marker, no `Exif\0\0` prefix) and `icc` is an ICC profile.
+#[derive(Debug, Default, Clone)]
+struct SourceMetadata {
+    exif: Option<Vec<u8>>,
+    icc: Option<Vec<u8>>,
+}
+
+impl SourceMetadata {
+    fn is_empty(&self) -> bool {
+        self.exif.is_none() && self.icc.is_none()
+    }
+}
+
+fn decode_oriented(input_path: &str) -> Result<(image::DynamicImage, SourceMetadata), String> {
     let mut decoder = ImageReader::open(input_path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?
         .into_decoder()
         .map_err(|e| e.to_string())?;
 
-    // Read orientation before the decoder is consumed. The `image` crate does not apply
-    // it automatically, which is why unrotated iPhone photos used to come out sideways.
+    // Read orientation and metadata before the decoder is consumed. The `image` crate does
+    // not apply orientation automatically, which is why unrotated iPhone photos used to
+    // come out sideways.
     let orientation = decoder
         .orientation()
         .unwrap_or(Orientation::NoTransforms);
 
+    // Metadata is best-effort: a source that cannot report it should still convert.
+    let mut exif = decoder.exif_metadata().ok().flatten();
+    let icc = decoder.icc_profile().ok().flatten();
+
+    // Critical: the rotation is baked into the pixels below, so the Exif orientation tag
+    // has to be reset to "no transforms". Carrying the original tag forward would make
+    // every Exif-aware viewer rotate the image a second time.
+    if let Some(chunk) = exif.as_mut() {
+        let _ = Orientation::remove_from_exif_chunk(chunk);
+    }
+
     let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     img.apply_orientation(orientation);
-    Ok(img)
+    Ok((img, SourceMetadata { exif, icc }))
+}
+
+/// Re-attaches `meta` to already-encoded image bytes.
+///
+/// Only the JPEG, PNG and WebP containers can carry Exif/ICC here; anything else is
+/// returned unchanged. Callers that need to know whether metadata survived should consult
+/// [`format_carries_metadata`].
+fn attach_metadata(encoded: Vec<u8>, meta: &SourceMetadata) -> Vec<u8> {
+    use img_parts::{ImageEXIF, ImageICC};
+
+    if meta.is_empty() {
+        return encoded;
+    }
+
+    // Bytes is reference-counted, so this clone is cheap and lets us fall back to the
+    // original buffer when the container is not one img-parts understands.
+    let bytes = img_parts::Bytes::from(encoded);
+
+    let mut image = match img_parts::DynImage::from_bytes(bytes.clone()) {
+        Ok(Some(image)) => image,
+        // Unsupported container, or bytes img-parts could not parse. Either way the
+        // encoded image itself is fine — it just travels without metadata.
+        Ok(None) | Err(_) => return bytes.to_vec(),
+    };
+
+    if let Some(exif) = &meta.exif {
+        image.set_exif(Some(img_parts::Bytes::from(exif.clone())));
+    }
+    if let Some(icc) = &meta.icc {
+        image.set_icc_profile(Some(img_parts::Bytes::from(icc.clone())));
+    }
+
+    if let img_parts::DynImage::Png(png) = &mut image {
+        move_png_exif_before_idat(png);
+    }
+
+    image.encoder().bytes().to_vec()
+}
+
+/// Moves the `eXIf` chunk ahead of the first `IDAT`.
+///
+/// `img-parts` appends `eXIf` just before `IEND`. The PNG spec allows it either side of the
+/// image data, but decoders commonly only surface ancillary chunks they meet before `IDAT`
+/// — the `image` crate included — so metadata written after it reads back as absent.
+fn move_png_exif_before_idat(png: &mut img_parts::png::Png) {
+    const CHUNK_IDAT: [u8; 4] = *b"IDAT";
+    const CHUNK_EXIF: [u8; 4] = *b"eXIf";
+
+    let chunks = png.chunks_mut();
+
+    let Some(exif_at) = chunks.iter().position(|c| c.kind() == CHUNK_EXIF) else {
+        return;
+    };
+    let Some(idat_at) = chunks.iter().position(|c| c.kind() == CHUNK_IDAT) else {
+        return;
+    };
+    if exif_at < idat_at {
+        return;
+    }
+
+    let exif = chunks.remove(exif_at);
+    chunks.insert(idat_at, exif);
+}
+
+/// Whether an output format can carry Exif/ICC metadata through this app.
+///
+/// This tracks what `img-parts` supports, not what the file format permits: TIFF and AVIF
+/// both allow Exif in principle, but nothing here writes it.
+fn format_carries_metadata(format: &str) -> bool {
+    matches!(
+        format.to_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp"
+    )
 }
 
 /// libwebp's hard limit on either dimension.
@@ -248,7 +356,7 @@ const WEBP_MAX_DIMENSION: u32 = 16383;
 ///
 /// `quality` is the UI slider, 1-100. 100 switches to lossless, matching how `cwebp`
 /// treats the top of the range.
-fn encode_webp(img: &image::DynamicImage, dest: &Path, quality: u8) -> Result<(), String> {
+fn encode_webp(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     let (width, height) = (img.width(), img.height());
     if width > WEBP_MAX_DIMENSION || height > WEBP_MAX_DIMENSION {
         return Err(format!(
@@ -282,38 +390,35 @@ fn encode_webp(img: &image::DynamicImage, dest: &Path, quality: u8) -> Result<()
         return Err("WebP encoding failed".to_string());
     }
 
-    fs::write(dest, &*encoded).map_err(|e| e.to_string())
+    Ok(encoded.to_vec())
 }
 
-/// Encodes to `dest`, which is expected to be a fresh temporary path.
-fn encode_to(
+/// Encodes into memory rather than straight to disk, because metadata is spliced into the
+/// encoded container afterwards. Costs one encoded image per worker thread, which is small
+/// next to the decoded buffer already being held.
+fn encode_to_bytes(
     img: &image::DynamicImage,
-    dest: &Path,
     options: &ConversionOptions,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
+    let write_with = |format: ImageFormat| {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, format).map_err(|e| e.to_string())?;
+        Ok(buf.into_inner())
+    };
+
     match options.format.to_lowercase().as_str() {
         "jpg" | "jpeg" => {
-            let file = File::create(dest).map_err(|e| e.to_string())?;
-            let writer = BufWriter::new(file);
-            let encoder = JpegEncoder::new_with_quality(writer, options.quality);
-            img.write_with_encoder(encoder).map_err(|e| e.to_string())
+            let mut buf = Vec::new();
+            let encoder = JpegEncoder::new_with_quality(&mut buf, options.quality);
+            img.write_with_encoder(encoder).map_err(|e| e.to_string())?;
+            Ok(buf)
         }
-        "webp" => encode_webp(img, dest, options.quality),
-        "png" => img
-            .save_with_format(dest, ImageFormat::Png)
-            .map_err(|e| e.to_string()),
-        "avif" => img
-            .save_with_format(dest, ImageFormat::Avif)
-            .map_err(|e| e.to_string()),
-        "gif" => img
-            .save_with_format(dest, ImageFormat::Gif)
-            .map_err(|e| e.to_string()),
-        "bmp" => img
-            .save_with_format(dest, ImageFormat::Bmp)
-            .map_err(|e| e.to_string()),
-        "tiff" => img
-            .save_with_format(dest, ImageFormat::Tiff)
-            .map_err(|e| e.to_string()),
+        "webp" => encode_webp(img, options.quality),
+        "png" => write_with(ImageFormat::Png),
+        "avif" => write_with(ImageFormat::Avif),
+        "gif" => write_with(ImageFormat::Gif),
+        "bmp" => write_with(ImageFormat::Bmp),
+        "tiff" => write_with(ImageFormat::Tiff),
         other => Err(format!("Unsupported format: {}", other)),
     }
 }
@@ -346,19 +451,28 @@ fn convert_single_image(
         error: Some(error),
     };
 
-    let img = match decode_oriented(input_path) {
-        Ok(img) => img,
+    let (img, metadata) = match decode_oriented(input_path) {
+        Ok(decoded) => decoded,
         Err(e) => return failure(format!("Failed to open image: {}", e)),
     };
 
+    let mut encoded = match encode_to_bytes(&img, options) {
+        Ok(bytes) => bytes,
+        Err(e) => return failure(format!("Failed to save image: {}", e)),
+    };
+
+    if options.preserve_metadata {
+        encoded = attach_metadata(encoded, &metadata);
+    }
+
     // Always stage the encode in a temporary file and rename it into place. In replace
-    // mode the destination *is* the input, so encoding straight into it would truncate
+    // mode the destination *is* the input, so writing straight into it would truncate
     // the original before the first byte is written — a decode error, a full disk or a
     // crash mid-write would leave no copy of the source anywhere.
     let final_path = Path::new(&output_path);
     let temp = temp_path_for(final_path, input_path);
 
-    if let Err(e) = encode_to(&img, &temp, options) {
+    if let Err(e) = fs::write(&temp, &encoded) {
         let _ = fs::remove_file(&temp);
         return failure(format!("Failed to save image: {}", e));
     }
@@ -449,42 +563,21 @@ fn get_supported_input_formats() -> Vec<String> {
 
 #[tauri::command]
 fn get_supported_output_formats() -> Vec<OutputFormatInfo> {
+    let info = |name: &str, extension: &str, supports_quality: bool| OutputFormatInfo {
+        name: name.to_string(),
+        extension: extension.to_string(),
+        supports_quality,
+        supports_metadata: format_carries_metadata(extension),
+    };
+
     vec![
-        OutputFormatInfo {
-            name: "PNG".to_string(),
-            extension: "png".to_string(),
-            supports_quality: false,
-        },
-        OutputFormatInfo {
-            name: "JPEG".to_string(),
-            extension: "jpg".to_string(),
-            supports_quality: true,
-        },
-        OutputFormatInfo {
-            name: "WebP".to_string(),
-            extension: "webp".to_string(),
-            supports_quality: true,
-        },
-        OutputFormatInfo {
-            name: "AVIF".to_string(),
-            extension: "avif".to_string(),
-            supports_quality: false,
-        },
-        OutputFormatInfo {
-            name: "GIF".to_string(),
-            extension: "gif".to_string(),
-            supports_quality: false,
-        },
-        OutputFormatInfo {
-            name: "BMP".to_string(),
-            extension: "bmp".to_string(),
-            supports_quality: false,
-        },
-        OutputFormatInfo {
-            name: "TIFF".to_string(),
-            extension: "tiff".to_string(),
-            supports_quality: false,
-        },
+        info("PNG", "png", false),
+        info("JPEG", "jpg", true),
+        info("WebP", "webp", true),
+        info("AVIF", "avif", false),
+        info("GIF", "gif", false),
+        info("BMP", "bmp", false),
+        info("TIFF", "tiff", false),
     ]
 }
 
@@ -493,6 +586,9 @@ pub struct OutputFormatInfo {
     name: String,
     extension: String,
     supports_quality: bool,
+    /// Whether Exif/ICC survive conversion to this format, so the UI can say so instead of
+    /// leaving the user to discover it.
+    supports_metadata: bool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -534,6 +630,7 @@ mod tests {
             quality: 85,
             output_mode,
             output_folder: None,
+            preserve_metadata: true,
         }
     }
 
@@ -800,25 +897,22 @@ mod tests {
     #[test]
     fn lossy_webp_beats_lossless_on_photographic_content() {
         let dir = scratch_dir();
-
         let img = image::DynamicImage::ImageRgb8(noisy_image(256, 256));
 
-        let lossy = dir.join("q60.webp");
-        let lossless = dir.join("q100.webp");
-        encode_webp(&img, &lossy, 60).expect("lossy encode");
-        encode_webp(&img, &lossless, 100).expect("lossless encode");
+        let lossy = encode_webp(&img, 60).expect("lossy encode");
+        let lossless = encode_webp(&img, 100).expect("lossless encode");
 
-        let lossy_size = fs::metadata(&lossy).unwrap().len();
-        let lossless_size = fs::metadata(&lossless).unwrap().len();
         assert!(
-            lossy_size < lossless_size,
+            lossy.len() < lossless.len(),
             "expected lossy ({} bytes) to beat lossless ({} bytes)",
-            lossy_size,
-            lossless_size
+            lossy.len(),
+            lossless.len()
         );
 
         // And the result must still be a readable WebP of the right size.
-        let (w, h) = ImageReader::open(&lossy)
+        let path = dir.join("q60.webp");
+        fs::write(&path, &lossy).unwrap();
+        let (w, h) = ImageReader::open(&path)
             .unwrap()
             .with_guessed_format()
             .unwrap()
@@ -829,17 +923,15 @@ mod tests {
 
     #[test]
     fn webp_quality_slider_changes_output_size() {
-        let dir = scratch_dir();
         let img = image::DynamicImage::ImageRgb8(noisy_image(128, 128));
-
-        let low = dir.join("low.webp");
-        let high = dir.join("high.webp");
-        encode_webp(&img, &low, 20).unwrap();
-        encode_webp(&img, &high, 95).unwrap();
+        let low = encode_webp(&img, 20).unwrap();
+        let high = encode_webp(&img, 95).unwrap();
 
         assert!(
-            fs::metadata(&low).unwrap().len() < fs::metadata(&high).unwrap().len(),
-            "quality 20 should be smaller than quality 95"
+            low.len() < high.len(),
+            "quality 20 ({}) should be smaller than quality 95 ({})",
+            low.len(),
+            high.len()
         );
     }
 
@@ -850,9 +942,10 @@ mod tests {
         for (x, _y, px) in img.enumerate_pixels_mut() {
             *px = image::Rgba([255, 0, 0, if x < 16 { 0 } else { 255 }]);
         }
-        let dest = dir.join("alpha.webp");
-        encode_webp(&image::DynamicImage::ImageRgba8(img), &dest, 100).unwrap();
+        let encoded = encode_webp(&image::DynamicImage::ImageRgba8(img), 100).unwrap();
 
+        let dest = dir.join("alpha.webp");
+        fs::write(&dest, &encoded).unwrap();
         let decoded = image::open(&dest).expect("decode webp");
         assert!(decoded.color().has_alpha(), "alpha channel must survive");
         assert_eq!(decoded.to_rgba8().get_pixel(0, 0)[3], 0, "left half transparent");
@@ -861,9 +954,8 @@ mod tests {
 
     #[test]
     fn webp_rejects_oversized_images_with_a_clear_message() {
-        let dir = scratch_dir();
         let img = image::DynamicImage::new_rgb8(WEBP_MAX_DIMENSION + 1, 1);
-        let err = encode_webp(&img, &dir.join("huge.webp"), 80).unwrap_err();
+        let err = encode_webp(&img, 80).unwrap_err();
         assert!(err.contains("maximum dimension"), "got: {}", err);
     }
 
@@ -880,6 +972,320 @@ mod tests {
             .find(|f| f.extension == "webp")
             .expect("webp output format");
         assert!(webp.supports_quality, "lossy WebP means the slider applies");
+    }
+
+    /// Minimal but valid Exif block: little-endian TIFF header, one IFD entry holding the
+    /// orientation tag (0x0112), plus an ImageDescription (0x010E) so there is something
+    /// other than orientation to preserve.
+    fn exif_chunk_with_orientation(exif_orientation: u16) -> Vec<u8> {
+        let mut chunk: Vec<u8> = Vec::new();
+        chunk.extend_from_slice(b"II*\0"); // little-endian marker
+        chunk.extend_from_slice(&8u32.to_le_bytes()); // offset of first IFD
+        chunk.extend_from_slice(&2u16.to_le_bytes()); // entry count
+
+        // Orientation: SHORT, count 1.
+        chunk.extend_from_slice(&0x0112u16.to_le_bytes());
+        chunk.extend_from_slice(&3u16.to_le_bytes());
+        chunk.extend_from_slice(&1u32.to_le_bytes());
+        chunk.extend_from_slice(&exif_orientation.to_le_bytes());
+        chunk.extend_from_slice(&0u16.to_le_bytes()); // value padding
+
+        // ImageDescription: ASCII, 4 bytes, fits inline.
+        chunk.extend_from_slice(&0x010Eu16.to_le_bytes());
+        chunk.extend_from_slice(&2u16.to_le_bytes());
+        chunk.extend_from_slice(&4u32.to_le_bytes());
+        chunk.extend_from_slice(b"ab\0\0");
+
+        chunk.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        chunk
+    }
+
+    fn read_back_exif(path: &Path) -> Option<Vec<u8>> {
+        let mut decoder = ImageReader::open(path)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        decoder.exif_metadata().ok().flatten()
+    }
+
+    #[test]
+    fn exif_and_icc_are_attached_to_jpeg_output() {
+        let dir = scratch_dir();
+        let dest = dir.join("out.jpg");
+
+        let img = image::DynamicImage::ImageRgb8(noisy_image(32, 32));
+        let opts = options("jpg", OutputMode::SameFolder);
+        let meta = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: Some(b"fake-icc-profile".to_vec()),
+        };
+
+        let encoded = attach_metadata(encode_to_bytes(&img, &opts).unwrap(), &meta);
+        fs::write(&dest, &encoded).unwrap();
+
+        let exif = read_back_exif(&dest).expect("exif should survive");
+        assert!(
+            exif.windows(2).any(|w| w == [0x0E, 0x01]),
+            "ImageDescription tag should still be present"
+        );
+
+        let mut decoder = ImageReader::open(&dest)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        let icc = decoder.icc_profile().ok().flatten().expect("icc should survive");
+        assert_eq!(icc, b"fake-icc-profile");
+    }
+
+    /// Walks the PNG chunk sequence, returning the four-byte type codes in order.
+    fn png_chunk_kinds(bytes: &[u8]) -> Vec<String> {
+        let mut kinds = Vec::new();
+        let mut i = 8; // skip the signature
+        while i + 8 <= bytes.len() {
+            let len = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            let kind = String::from_utf8_lossy(&bytes[i + 4..i + 8]).to_string();
+            let is_end = kind == "IEND";
+            kinds.push(kind);
+            if is_end {
+                break;
+            }
+            i += 12 + len as usize;
+        }
+        kinds
+    }
+
+    #[test]
+    fn exif_survives_a_png_round_trip() {
+        let dir = scratch_dir();
+        let dest = dir.join("out.png");
+        let img = image::DynamicImage::ImageRgb8(noisy_image(16, 16));
+        let opts = options("png", OutputMode::SameFolder);
+        let meta = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: None,
+        };
+
+        let encoded = attach_metadata(encode_to_bytes(&img, &opts).unwrap(), &meta);
+        fs::write(&dest, &encoded).unwrap();
+
+        assert!(read_back_exif(&dest).is_some(), "png eXIf chunk should be readable");
+        assert!(image::open(&dest).is_ok(), "png should still decode");
+    }
+
+    /// `img-parts` puts `eXIf` after `IDAT`, where the `image` crate (and plenty of other
+    /// decoders) never look. Ordering is the whole reason PNG metadata reads back at all.
+    #[test]
+    fn png_exif_chunk_precedes_the_image_data() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(16, 16));
+        let opts = options("png", OutputMode::SameFolder);
+        let meta = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: None,
+        };
+
+        let encoded = attach_metadata(encode_to_bytes(&img, &opts).unwrap(), &meta);
+        let kinds = png_chunk_kinds(&encoded);
+
+        let exif_at = kinds.iter().position(|k| k == "eXIf").expect("eXIf chunk");
+        let idat_at = kinds.iter().position(|k| k == "IDAT").expect("IDAT chunk");
+        assert!(
+            exif_at < idat_at,
+            "eXIf must precede IDAT, got order: {:?}",
+            kinds
+        );
+    }
+
+    /// The trap this whole feature could easily walk into: we rotate the pixels ourselves,
+    /// so if the original orientation tag were carried through, every Exif-aware viewer
+    /// would rotate the output a second time.
+    #[test]
+    fn preserved_exif_has_its_orientation_tag_neutralised() {
+        let mut chunk = exif_chunk_with_orientation(6); // 6 = rotate 90 clockwise
+        assert_eq!(
+            Orientation::from_exif_chunk(&chunk),
+            Some(Orientation::Rotate90),
+            "fixture should start out rotated"
+        );
+
+        // Same call decode_oriented makes after reading the chunk.
+        let removed = Orientation::remove_from_exif_chunk(&mut chunk);
+        assert_eq!(removed, Some(Orientation::Rotate90));
+        assert_eq!(
+            Orientation::from_exif_chunk(&chunk),
+            Some(Orientation::NoTransforms),
+            "tag must be reset or viewers will double-rotate"
+        );
+
+        // The rest of the block must be untouched.
+        assert!(
+            chunk.windows(2).any(|w| w == [0x0E, 0x01]),
+            "clearing orientation must not drop other tags"
+        );
+    }
+
+    #[test]
+    fn exif_survives_a_webp_round_trip() {
+        let dir = scratch_dir();
+        let dest = dir.join("out.webp");
+        let img = image::DynamicImage::ImageRgb8(noisy_image(32, 32));
+        let opts = options("webp", OutputMode::SameFolder);
+        let meta = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: None,
+        };
+
+        // A plain libwebp file is a simple VP8/VP8L container; img-parts has to promote it
+        // to the extended VP8X form before it can hold an EXIF chunk.
+        let encoded = attach_metadata(encode_to_bytes(&img, &opts).unwrap(), &meta);
+        fs::write(&dest, &encoded).unwrap();
+
+        assert!(image::open(&dest).is_ok(), "webp should still decode");
+        assert!(read_back_exif(&dest).is_some(), "webp EXIF chunk should be readable");
+    }
+
+    /// End-to-end through the real conversion entry point, which is the only test that
+    /// exercises the metadata *read* side in `decode_oriented`.
+    #[test]
+    fn metadata_travels_from_source_file_to_converted_output() {
+        let dir = scratch_dir();
+        let source = dir.join("source.jpg");
+
+        // Build a source JPEG that genuinely carries EXIF and an ICC profile.
+        let img = image::DynamicImage::ImageRgb8(noisy_image(48, 48));
+        let seed = options("jpg", OutputMode::SameFolder);
+        let planted = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: Some(b"planted-icc-profile".to_vec()),
+        };
+        fs::write(
+            &source,
+            attach_metadata(encode_to_bytes(&img, &seed).unwrap(), &planted),
+        )
+        .unwrap();
+
+        // Convert it to PNG, a different container entirely.
+        let opts = options("png", OutputMode::SameFolder);
+        let dest = dir.join("source.png");
+        let result = convert_single_image(
+            source.to_str().unwrap(),
+            dest.to_str().unwrap().to_string(),
+            &opts,
+        );
+        assert!(result.success, "conversion failed: {:?}", result.error);
+
+        let exif = read_back_exif(&dest).expect("exif should reach the output");
+        assert!(
+            exif.windows(2).any(|w| w == [0x0E, 0x01]),
+            "ImageDescription should have travelled across formats"
+        );
+
+        let mut decoder = ImageReader::open(&dest)
+            .unwrap()
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(
+            decoder.icc_profile().ok().flatten().as_deref(),
+            Some(b"planted-icc-profile".as_slice()),
+            "icc profile should have travelled too"
+        );
+    }
+
+    #[test]
+    fn conversion_with_preserving_off_strips_source_metadata() {
+        let dir = scratch_dir();
+        let source = dir.join("source.jpg");
+
+        let img = image::DynamicImage::ImageRgb8(noisy_image(32, 32));
+        let seed = options("jpg", OutputMode::SameFolder);
+        let planted = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: None,
+        };
+        fs::write(
+            &source,
+            attach_metadata(encode_to_bytes(&img, &seed).unwrap(), &planted),
+        )
+        .unwrap();
+        assert!(read_back_exif(&source).is_some(), "source should have exif");
+
+        let mut opts = options("jpg", OutputMode::SameFolder);
+        opts.preserve_metadata = false;
+        let dest = dir.join("stripped-out.jpg");
+        let result = convert_single_image(
+            source.to_str().unwrap(),
+            dest.to_str().unwrap().to_string(),
+            &opts,
+        );
+        assert!(result.success, "conversion failed: {:?}", result.error);
+        assert!(
+            read_back_exif(&dest).is_none(),
+            "metadata must not appear when preserving is off"
+        );
+    }
+
+    #[test]
+    fn stripping_metadata_produces_a_clean_file() {
+        let dir = scratch_dir();
+        let dest = dir.join("stripped.jpg");
+        let img = image::DynamicImage::ImageRgb8(noisy_image(16, 16));
+        let opts = options("jpg", OutputMode::SameFolder);
+
+        // preserve_metadata=false means attach_metadata is never called.
+        let encoded = encode_to_bytes(&img, &opts).unwrap();
+        fs::write(&dest, &encoded).unwrap();
+
+        assert!(
+            read_back_exif(&dest).is_none(),
+            "no metadata should be written when preserving is off"
+        );
+    }
+
+    #[test]
+    fn formats_that_cannot_carry_metadata_still_encode() {
+        let dir = scratch_dir();
+        let img = image::DynamicImage::ImageRgb8(noisy_image(16, 16));
+        let meta = SourceMetadata {
+            exif: Some(exif_chunk_with_orientation(1)),
+            icc: Some(b"fake-icc".to_vec()),
+        };
+
+        // BMP and GIF are not img-parts containers; attach_metadata must pass the bytes
+        // through untouched rather than corrupting or dropping them.
+        for format in ["bmp", "gif", "tiff"] {
+            let opts = options(format, OutputMode::SameFolder);
+            let plain = encode_to_bytes(&img, &opts).unwrap();
+            let attached = attach_metadata(plain.clone(), &meta);
+            assert_eq!(attached, plain, "{} bytes should be unchanged", format);
+
+            let dest = dir.join(format!("out.{}", format));
+            fs::write(&dest, &attached).unwrap();
+            assert!(image::open(&dest).is_ok(), "{} should still be readable", format);
+        }
+    }
+
+    #[test]
+    fn metadata_support_is_reported_per_format() {
+        let formats = get_supported_output_formats();
+        let supports = |ext: &str| {
+            formats
+                .iter()
+                .find(|f| f.extension == ext)
+                .unwrap()
+                .supports_metadata
+        };
+
+        for ext in ["jpg", "png", "webp"] {
+            assert!(supports(ext), "{} should carry metadata", ext);
+        }
+        for ext in ["avif", "gif", "bmp", "tiff"] {
+            assert!(!supports(ext), "{} does not carry metadata here", ext);
+        }
     }
 
     #[test]

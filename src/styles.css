@@ -232,6 +232,40 @@ input[type="range"]::-webkit-slider-thumb {
   text-overflow: ellipsis;
 }
 
+.checkbox-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  /* Overrides the fixed width .option-row gives its labels. */
+  width: auto !important;
+  font-weight: 400 !important;
+}
+
+.checkbox-label input[type="checkbox"] {
+  accent-color: #4a9eff;
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.option-hint {
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.option-hint:empty {
+  display: none;
+}
+
 /* Buttons */
 .primary-btn {
   width: 100%;
@@ -347,6 +381,10 @@ input[type="range"]::-webkit-slider-thumb {
     background: #333;
     border-color: #555;
     color: #e0e0e0;
+  }
+
+  .option-hint {
+    color: #999;
   }
 
   input[type="range"] {

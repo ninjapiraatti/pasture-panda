@@ -11,7 +11,7 @@ renumber when items close.
 | 4 | AVIF input advertised but not decodable | High | **Fixed** |
 | 5 | Replace mode can destroy the original file | High | **Fixed** |
 | 6 | WebP output is lossless-only | Medium | **Fixed** |
-| 7 | EXIF and ICC profiles are silently dropped | Medium | Partly fixed |
+| 7 | EXIF and ICC profiles are silently dropped | Medium | **Fixed** (JPEG/PNG/WebP) |
 | 8 | Filenames are interpolated into `innerHTML` | Low | **Fixed** |
 | 9 | Assorted smaller items | Low | Partly fixed |
 
@@ -19,9 +19,9 @@ renumber when items close.
 
 Read this before trusting any "Fixed" above.
 
-`cargo test` in `src-tauri/` runs 20 tests covering the Rust conversion logic: output-path
+`cargo test` in `src-tauri/` runs 30 tests covering the Rust conversion logic: output-path
 planning for all three output modes, batch collision handling, the atomic-write behaviour,
-and the WebP encoder. They call the conversion functions directly.
+the WebP encoder, and Exif/ICC preservation. They call the conversion functions directly.
 
 **Nothing about the running app is covered by an automated test.** There is no frontend test
 tooling in the project at all, and Tauri's WebDriver support does not extend to macOS, so
@@ -155,27 +155,55 @@ So the old path was 3.2x larger than its own input; the new one is ~30% smaller.
 Four tests cover the encoder: lossy beats lossless on noisy content, the quality slider
 changes output size, alpha survives a round trip, and oversized images produce a clear error.
 
-## 7. EXIF and ICC profiles are silently dropped — Partly fixed
+## 7. EXIF and ICC profiles are silently dropped — Fixed for JPEG, PNG and WebP
 
 The `image` crate does not carry metadata through a decode/encode round trip, and does not
 apply EXIF orientation on decode.
 
-**Orientation is now applied.** `decode_oriented` reads `ImageDecoder::orientation()` before
-the decoder is consumed and calls `DynamicImage::apply_orientation`, so rotated iPhone photos
-come out the right way up. The file list reports post-rotation dimensions to match, via
+**Orientation is applied.** `decode_oriented` reads `ImageDecoder::orientation()` before the
+decoder is consumed and calls `DynamicImage::apply_orientation`, so rotated iPhone photos come
+out the right way up. The file list reports post-rotation dimensions to match, via
 `orientation_swaps_axes` — otherwise a portrait photo would be listed as landscape.
 
-Note this is only as good as the decoder's EXIF support: `image` reads orientation for JPEG
-and a few others. Where it cannot, it reports `NoTransforms` and behaviour is unchanged.
+**Exif and ICC now travel with the image.** `decode_oriented` also lifts the raw Exif block
+and ICC profile off the decoder, and `attach_metadata` splices them into the encoded output
+using `img-parts`. Capture date, GPS, camera data and colour profile survive, so wide-gamut
+images no longer shift colour.
 
-**Still open:**
+Because metadata is spliced into the encoded container, `encode_to_bytes` now encodes into
+memory rather than streaming to the file. That costs one encoded image per worker thread,
+which is small next to the decoded buffer already held.
 
-- ICC profiles are discarded, so wide-gamut images shift colour.
-- Capture date, GPS, copyright and camera data are lost with no warning.
-- No "strip metadata" checkbox. Stripping is a real use case; it just shouldn't be the
-  silent and only behaviour.
+**Two traps that had to be handled, both worth not undoing:**
 
-Preserving EXIF/ICC needs metadata plumbing the `image` crate won't do on its own.
+1. **Double rotation.** The rotation is baked into the pixels, so carrying the original
+   orientation tag forward would make every Exif-aware viewer rotate the output *again*.
+   `Orientation::remove_from_exif_chunk` resets the tag to "no transforms" while leaving the
+   rest of the block intact. `preserved_exif_has_its_orientation_tag_neutralised` covers this.
+2. **PNG chunk order.** `img-parts` appends `eXIf` just before `IEND`, i.e. after `IDAT`. That
+   is legal per the PNG spec but decoders commonly only surface ancillary chunks they meet
+   *before* the image data — the `image` crate included — so the metadata read back as absent.
+   `move_png_exif_before_idat` relocates it, and `png_exif_chunk_precedes_the_image_data`
+   asserts the ordering rather than merely that the chunk exists.
+
+**A "Keep EXIF and colour profile" checkbox** is in the options, checked by default, so
+stripping is a deliberate choice. It disables itself with an explanatory hint when the chosen
+output format cannot carry metadata, and `preserve_metadata` is gated on the format as well as
+the checkbox, since a disabled checkbox keeps its checked state.
+
+**Limits, all deliberate:**
+
+- **Only JPEG, PNG and WebP output carry metadata.** TIFF and AVIF both permit Exif in
+  principle, but nothing here writes it, and GIF/BMP have nowhere to put it. Rather than fail
+  silently, `OutputFormatInfo.supports_metadata` reports this per format and the UI says so.
+- **Reading metadata depends on the source decoder.** `image` surfaces Exif for JPEG, PNG,
+  WebP and a few others; elsewhere it reports nothing and there is nothing to carry.
+- **Exif's own stored dimensions are not rewritten.** `PixelXDimension`/`PixelYDimension` in a
+  preserved block still describe the pre-rotation image. Viewers use the container dimensions
+  for display, so this is cosmetic, but it is wrong in the file. Fixing it means editing Exif
+  tags rather than passing the block through, which is a much larger job.
+- **XMP and IPTC are still dropped.** `image` can read both
+  (`xmp_metadata`, `iptc_metadata`); nothing here carries them.
 
 ## 8. Filenames are interpolated into `innerHTML` — Fixed
 
@@ -216,7 +244,7 @@ Two things worth knowing about the CSP:
   and reports all three in the status line, naming up to three failed files and counting the
   rest. Previously every `Err` from `get_images_info` was dropped and the file just silently
   didn't appear.
-- **Tests exist.** 20 of them, described under "Verification status" at the top.
+- **Tests exist.** 30 of them, described under "Verification status" at the top.
 
 **Still open:**
 
@@ -244,13 +272,25 @@ and none of them have been confirmed since the changes above:
 3. **The WebP quality slider** — it now appears for WebP, where it previously did not. Confirm
    it is visible and that a lower value produces a smaller file.
 4. **A rotated photo** — convert a photo straight off an iPhone and confirm the output is
-   upright and that the dimensions in the file list match the output.
-5. **Replace mode on a throwaway copy** — confirm the original is replaced correctly and no
+   upright and that the dimensions in the file list match the output. Then check it is upright
+   in *another* Exif-aware viewer too (Preview, Finder, a browser): if the orientation tag were
+   not being cleared, the pixels would be right here and the image would appear rotated there.
+5. **Metadata actually survives** — convert a photo with `Keep EXIF and colour profile` on and
+   inspect the output with `exiftool` or Preview's inspector. Capture date, camera and GPS
+   should be present. Do it for JPEG, PNG *and* WebP output; each uses a different container
+   path. Then repeat with the box unchecked and confirm the output is clean.
+6. **The metadata checkbox disables itself** — pick GIF, BMP, TIFF or AVIF output and confirm
+   the checkbox greys out with a hint saying that format cannot carry metadata. The new
+   checkbox row is also the only untested piece of layout; check it looks right in both light
+   and dark mode.
+7. **A wide-gamut image** — convert something with a non-sRGB profile and confirm the colours
+   don't shift, which is the ICC half of the fix.
+8. **Replace mode on a throwaway copy** — confirm the original is replaced correctly and no
    `.tmp` files are left in the folder. Use a copy; this is the destructive path.
-6. **A file with `<` or `>` in its name** — e.g. `<img src=x onerror=alert(1)>.png`. The name
+9. **A file with `<` or `>` in its name** — e.g. `<img src=x onerror=alert(1)>.png`. The name
    should appear as literal text in the list.
-7. **Errors are visible** — add a `.png` that isn't really a PNG and confirm the status line
-   names it instead of silently skipping it.
+10. **Errors are visible** — add a `.png` that isn't really a PNG and confirm the status line
+    names it instead of silently skipping it.
 
 Note that a production build (`npm run tauri build`) is required to test anything CSP-related;
 `tauri dev` does not apply the CSP at all.
@@ -263,15 +303,15 @@ Not bugs — recorded so they don't get lost.
 
 macOS has shipped a built-in **Finder → Quick Actions → Convert Image** since Ventura,
 with format choice, a size option and a "preserve metadata" checkbox. That is the bar.
-Right now this app does less: no resize, no metadata preservation, no HEIC, and WebP
-output that is larger than the input.
+
+The app now clears part of it: lossy WebP (which Finder won't produce) and metadata
+preservation with a strip toggle. It is still behind on resize and HEIC input.
 
 The gaps that would give it a clear reason to exist, roughly in order of value:
 
-1. **Lossy WebP and working AVIF** (items 4 and 6) — the formats Finder won't touch, and
-   exactly what web work needs.
-2. **Resize** — long-edge max, percentage, fit-in-box. The biggest missing feature for web
-   use, arguably more than format choice.
+1. **Resize** — long-edge max, percentage, fit-in-box. Now the biggest missing feature for
+   web use, arguably more than format choice.
+2. **Working AVIF input** (item 4) — output already works; decoding needs dav1d.
 3. **Saved presets** — e.g. "blog hero: 1600px wide, WebP q80, strip EXIF" as one click.
    Finder makes you re-pick settings every time.
 4. **Watched folders** — drop a file into `~/to-optimize`, get a converted copy out.

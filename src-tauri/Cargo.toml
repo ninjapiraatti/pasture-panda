@@ -21,4 +21,5 @@ image = "0.25.10"
 tauri-plugin-dialog = "2.6.0"
 rayon = "1"
 webp = "0.3.1"
+img-parts = "0.4.0"
 
