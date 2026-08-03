@@ -9,10 +9,14 @@ crate.
 
 ## Status
 
-Early. It works and it is useful, but it is a personal tool rather than a polished product.
-Read [ISSUES.md](ISSUES.md) before trusting it with anything irreplaceable — in particular
-**"Replace original files" can destroy a source file** if a conversion fails partway
-through (issue 5), and image metadata is silently discarded (issue 7).
+Early, but no longer known to lose data. Conversions are written to a temporary file and
+renamed into place, so a failed encode can't destroy a source file. Remaining gaps are in
+[ISSUES.md](ISSUES.md): ICC profiles and EXIF metadata are still discarded (orientation
+*is* applied now), there's no progress bar or cancel, and no resize.
+
+Testing is uneven and worth knowing about before you trust a change: `cargo test` covers
+the Rust conversion logic well, and nothing covers the running app. See
+[Tests](#tests) below.
 
 ## Running it
 
@@ -46,8 +50,7 @@ Tauri call fails — no file dialog, no conversion — so it is only useful for 
    rather than expanded. Each file shows its dimensions, format and size, and can be
    removed individually.
 2. **Pick an output format** — PNG, JPEG, WebP, AVIF, GIF, BMP or TIFF.
-3. **Set quality** — the slider only appears for JPEG, which is the only format here with a
-   quality parameter (see the WebP note below).
+3. **Set quality** — the slider appears for JPEG and WebP.
 4. **Choose where output goes:**
    - *Same folder as original* — writes alongside the input. Never overwrites: an existing
      `photo.webp` means the new file becomes `photo_1.webp`.
@@ -55,9 +58,12 @@ Tauri call fails — no file dialog, no conversion — so it is only useful for 
      renaming.
    - *Replace original files* — overwrites the input when the format is unchanged, or
      writes the new file and deletes the original when it changed. Asks for confirmation
-     first. This is the destructive option; see issue 5.
+     first. Still the destructive option, but a failed conversion now leaves the original
+     untouched.
 5. **Convert** — the whole batch runs in one go, and the status line reports how many
    succeeded.
+
+Files that can't be read are named in the status line rather than silently skipped.
 
 Conversion runs in parallel across all cores (rayon) on a background thread, so the window
 stays responsive. There is no progress bar and no way to cancel a running batch — a large
@@ -67,20 +73,42 @@ AVIF batch in particular can take a while with nothing to show for it.
 
 **Input:** PNG, JPEG, GIF, WebP, BMP, TIFF, ICO.
 
-The UI also lists AVIF as an input format, but **AVIF files cannot actually be decoded** —
-that needs the `image` crate's non-default `avif-native` feature. Adding an AVIF file will
-fail at conversion time with an unhelpful error. Tracked as issue 4.
+AVIF is deliberately *not* an input format. Decoding it needs the `image` crate's
+non-default `avif-native` feature, which links dav1d as a build-time system dependency; the
+app used to advertise AVIF input and then fail on it (issue 4).
 
-**Output:** PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF.
+**Output:** PNG, JPEG, **WebP (lossy)**, AVIF, GIF, BMP, TIFF.
 
-Two caveats worth knowing before reaching for this tool:
+The quality slider applies to JPEG and WebP. For WebP, 100 means lossless.
 
-- **WebP output is lossless only.** The `image` crate offers no lossy WebP encoder, so
-  converting a JPEG to WebP will usually produce a *larger* file. Issue 6.
-- **EXIF and ICC data are dropped.** Orientation is not applied on decode, so iPhone photos
-  come out rotated wrong, and wide-gamut images shift colour. Issue 7.
+Remaining caveats:
 
-There is no resize option, and no HEIC support.
+- **ICC profiles and EXIF metadata are dropped.** Capture date, GPS and camera data don't
+  survive, and wide-gamut images shift colour. EXIF *orientation* is applied, so photos come
+  out upright. Issue 7.
+- **No resize, and no HEIC support** — the two most conspicuous absences for a macOS image
+  tool. See the product notes in ISSUES.md.
+
+## Tests
+
+```bash
+cd src-tauri && cargo test
+```
+
+20 tests covering the Rust side: output-path planning across all three output modes, batch
+collision handling, the atomic-write guarantee, and the WebP encoder. The most important one
+is `encode_failure_after_decode_leaves_the_original_intact`, which reproduces the old
+replace-mode data loss by feeding an image too wide for JPEG through the encoder.
+
+**The running app has no automated coverage.** There's no frontend test tooling in the
+project, and Tauri's WebDriver support doesn't extend to macOS, so the UI, drag and drop,
+IPC and the file dialogs are hand-checked. ISSUES.md has a "Needs manual verification"
+checklist for exactly this.
+
+One trap when testing security-related config: **the CSP does not apply under
+`npm run tauri dev`.** Tauri only injects the CSP header for assets it serves itself, and in
+dev the page comes from the Vite server. Use `npm run tauri build` to test anything
+CSP-related.
 
 ## Layout
 
@@ -99,4 +127,9 @@ interesting one is `convert_images`, which reserves every destination path up fr
 single-threaded (`plan_output_paths`) before fanning the encoding out in parallel — doing
 it in the other order races two inputs onto the same filename.
 
-There are no tests yet.
+Two invariants in `lib.rs` worth not breaking:
+
+- `convert_single_image` always encodes to a temp file and renames it into place. Writing
+  straight to the destination is what used to destroy originals in replace mode.
+- `read_image_info` reports orientation-corrected dimensions, because `decode_oriented`
+  rotates on decode. If one changes, the other has to.

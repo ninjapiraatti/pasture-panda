@@ -8,12 +8,25 @@ renumber when items close.
 | 1 | Conversion ran on the main thread | High | **Fixed** |
 | 2 | Conversion was fully sequential | High | **Fixed** |
 | 3 | Drag and drop never worked | High | **Fixed** |
-| 4 | AVIF input advertised but not decodable | High | **Todo** |
-| 5 | Replace mode can destroy the original file | High | Open |
-| 6 | WebP output is lossless-only | Medium | Open |
-| 7 | EXIF and ICC profiles are silently dropped | Medium | Open |
-| 8 | Filenames are interpolated into `innerHTML` | Low | Open |
-| 9 | Assorted smaller items | Low | Open |
+| 4 | AVIF input advertised but not decodable | High | **Fixed** |
+| 5 | Replace mode can destroy the original file | High | **Fixed** |
+| 6 | WebP output is lossless-only | Medium | **Fixed** |
+| 7 | EXIF and ICC profiles are silently dropped | Medium | Partly fixed |
+| 8 | Filenames are interpolated into `innerHTML` | Low | **Fixed** |
+| 9 | Assorted smaller items | Low | Partly fixed |
+
+## Verification status
+
+Read this before trusting any "Fixed" above.
+
+`cargo test` in `src-tauri/` runs 20 tests covering the Rust conversion logic: output-path
+planning for all three output modes, batch collision handling, the atomic-write behaviour,
+and the WebP encoder. They call the conversion functions directly.
+
+**Nothing about the running app is covered by an automated test.** There is no frontend test
+tooling in the project at all, and Tauri's WebDriver support does not extend to macOS, so
+the UI, the drag/drop handler, IPC and the file dialogs are all verified by hand or not at
+all. The checklist under "Needs manual verification" below is the part a human has to do.
 
 ---
 
@@ -68,7 +81,7 @@ filesystem paths. Two behaviour changes worth knowing about:
 **Not verified end-to-end.** Both the Rust and TS sides compile, but confirming an actual
 drag needs a human and a running app.
 
-## 4. AVIF input advertised but not decodable — Todo
+## 4. AVIF input advertised but not decodable — Fixed
 
 `get_supported_input_formats()` lists AVIF and the file picker filter accepts `.avif`, but
 the app cannot read AVIF files.
@@ -78,90 +91,169 @@ the default set — so AVIF output works. AVIF *decoding* comes from `avif-nativ
 (mp4parse + dav1d), which is **not** default. `image = "0.25.10"` pulls default features
 only, so any AVIF input fails at decode with an opaque error.
 
-Two ways out:
+Resolved by dropping the claim rather than adding the dependency: AVIF is gone from
+`get_supported_input_formats()`, from `IMAGE_EXTENSIONS` in `src/main.ts`, and from the
+drop-zone hint in `index.html`. AVIF remains an *output* format, which works on default
+features. `avif_is_not_advertised_as_an_input_format` guards against it creeping back.
 
-- **Enable decoding:** `image = { version = "0.25.10", features = ["avif-native"] }`. This
-  links dav1d, which is a C dependency and needs to be available at build time — it adds
-  a system prerequisite to the build and to CI, and needs checking against the bundling
-  setup before committing to it.
-- **Drop the claim:** remove AVIF from `get_supported_input_formats()` and from
-  `IMAGE_EXTENSIONS` in `src/main.ts`. Keeps AVIF as an output-only format, which is
-  honest and costs nothing.
+Enabling real AVIF decoding is still an option later:
+`image = { version = "0.25.10", features = ["avif-native"] }`. It links dav1d, a C library
+that has to be present at build time, so it adds a system prerequisite for every build
+machine and needs checking against the bundling setup.
 
-Related: AVIF encoding through ravif at the `image` crate's default settings is slow. Now
-that batches run in parallel this is less painful than it was, but a large AVIF batch is
-still a long wait with no progress indication (see item 9).
+Related and still true: AVIF encoding through ravif at the `image` crate's default settings
+is slow. A large AVIF batch is a long wait with no progress indication (see item 9).
 
-## 5. Replace mode can destroy the original file — Open
+## 5. Replace mode can destroy the original file — Fixed
 
-When the output format matches the input format, `get_output_path` returns the input path
-and `convert_single_image` opens it with `File::create`, which **truncates the original
-before encoding begins**. A decode failure, a full disk, or a crash mid-write leaves the
-source file destroyed with no copy anywhere.
+When the output format matched the input format, `get_output_path` returned the input path
+and `convert_single_image` opened it with `File::create`, which **truncated the original
+before encoding began**. A decode failure, a full disk or a crash mid-write left the source
+destroyed with no copy anywhere.
 
-Fix is the standard one: encode to a temporary file in the same directory, then
-`fs::rename` over the original, which is atomic within a volume.
+Every conversion now encodes to a hidden temporary file in the destination directory and
+`fs::rename`s it into place, which is atomic within a volume. The temp name includes a hash
+of the input path so parallel conversions cannot collide on it, and it is cleaned up on
+failure. This applies to all output modes, not just replace — there is no reason for any of
+them to expose a partially written file.
 
-This is the highest-severity item still open — it is the only way the app can lose data,
-and "Replace original files" is a normal-looking choice in the dropdown.
+Two tests cover it. `encode_failure_after_decode_leaves_the_original_intact` is the real
+regression test: it feeds a 70000x1 PNG to the JPEG encoder, which decodes fine and then
+fails at encode time because JPEG cannot store a dimension above 65535 — precisely the
+window where the old code had already truncated the destination. Reverting the staging logic
+makes it fail with "original must still exist", i.e. the old code deleted the file outright.
 
-Also worth noting: replacing a JPEG with a JPEG re-encodes at the slider quality, so it is
-a silent generation-loss step. The UI does not say so.
+Still true, and still not surfaced in the UI: replacing a JPEG with a JPEG re-encodes at the
+slider quality, so it is a silent generation-loss step.
 
-## 6. WebP output is lossless-only — Open
+## 6. WebP output is lossless-only — Fixed
 
-`WebPEncoder::new_lossless` is the only WebP encoder the `image` crate offers, so
-converting a JPEG to WebP will usually produce a *larger* file — the opposite of why
-people reach for WebP. `OutputFormatInfo.supports_quality` correctly reports `false`, so
-the UI at least doesn't lie about the slider, but the format itself under-delivers.
+`WebPEncoder::new_lossless` was the only WebP encoder the `image` crate offers, so
+converting a JPEG to WebP produced a *larger* file — the opposite of why people reach for
+WebP.
 
-Fixing means a dedicated encoder (`webp` crate / libwebp bindings). This is probably the
-single highest-value functional change in the list — lossy WebP is the main reason a web
-developer would pick this tool over what macOS already ships.
+Now encoded through the `webp` crate (libwebp bindings). `libwebp-sys` vendors the C source
+and builds it with `cc`, so this adds a C compile step to the build but no system package.
+`encode_webp` picks RGB or RGBA depending on whether the source actually has alpha, goes
+through `from_rgb`/`from_rgba` rather than `from_image` so 16-bit PNG and TIFF sources are
+handled, and treats slider quality 100 as lossless the way `cwebp` does. libwebp signals
+failure with an empty buffer rather than an error, so that is checked explicitly, and the
+16383px dimension limit is reported as a readable message instead of a generic failure.
 
-## 7. EXIF and ICC profiles are silently dropped — Open
+`OutputFormatInfo.supports_quality` for WebP is now `true`, so the slider appears and applies.
+
+Measured on an 1200x800 photographic test image saved as JPEG q85:
+
+| | size |
+|---|---|
+| source JPEG q85 | 861 KB |
+| old WebP (lossless) | 2717 KB |
+| new WebP (lossy q85) | 600 KB |
+
+So the old path was 3.2x larger than its own input; the new one is ~30% smaller.
+
+Four tests cover the encoder: lossy beats lossless on noisy content, the quality slider
+changes output size, alpha survives a round trip, and oversized images produce a clear error.
+
+## 7. EXIF and ICC profiles are silently dropped — Partly fixed
 
 The `image` crate does not carry metadata through a decode/encode round trip, and does not
-apply EXIF orientation on decode. Consequences:
+apply EXIF orientation on decode.
 
-- iPhone photos come out rotated wrong.
-- Wide-gamut images shift colour, because the ICC profile is discarded.
-- Capture dates, GPS, copyright and camera data are lost with no warning.
+**Orientation is now applied.** `decode_oriented` reads `ImageDecoder::orientation()` before
+the decoder is consumed and calls `DynamicImage::apply_orientation`, so rotated iPhone photos
+come out the right way up. The file list reports post-rotation dimensions to match, via
+`orientation_swaps_axes` — otherwise a portrait photo would be listed as landscape.
 
-At minimum, apply orientation on decode. Ideally preserve EXIF/ICC, with a "strip
-metadata" checkbox for the people who want that (which is a real use case — it just
-shouldn't be the silent default).
+Note this is only as good as the decoder's EXIF support: `image` reads orientation for JPEG
+and a few others. Where it cannot, it reports `NoTransforms` and behaviour is unchanged.
 
-## 8. Filenames are interpolated into `innerHTML` — Open
+**Still open:**
 
-`renderFileList` builds markup with `${img.name}` in a template string. macOS filenames
-may contain `<` and `>`, so a file named `<img src=x onerror=...>.png` executes script.
+- ICC profiles are discarded, so wide-gamut images shift colour.
+- Capture date, GPS, copyright and camera data are lost with no warning.
+- No "strip metadata" checkbox. Stripping is a real use case; it just shouldn't be the
+  silent and only behaviour.
 
-Ordinarily minor, but the blast radius here is larger than usual: `tauri.conf.json` sets
-`csp: null` and `withGlobalTauri: true`, and custom commands are not gated by capabilities
-in Tauri v2. Injected script therefore reaches `window.__TAURI__.core.invoke` and can call
-`convert_images` in `replace_original` mode against arbitrary paths.
+Preserving EXIF/ICC needs metadata plumbing the `image` crate won't do on its own.
 
-Three small independent fixes: use `textContent` for filenames, set `withGlobalTauri` to
-`false` (the frontend imports the module API and does not need the global), and configure
-a real CSP.
+## 8. Filenames are interpolated into `innerHTML` — Fixed
 
-## 9. Assorted smaller items — Open
+`renderFileList` built markup with `${img.name}` in a template string. macOS filenames may
+contain `<` and `>`, so a file named `<img src=x onerror=...>.png` executed script. The blast
+radius was larger than usual because `csp: null` and `withGlobalTauri: true` meant injected
+script reached `window.__TAURI__.core.invoke` and could call `convert_images` in
+`replace_original` mode against arbitrary paths.
+
+All three fixes are in:
+
+- `renderFileList` and `populateFormatSelect` build DOM nodes and assign filenames through
+  `textContent`, so filename bytes are never parsed as markup. The remove button closes over
+  its index instead of round-tripping through a `data-index` attribute.
+- `withGlobalTauri` is `false`. The frontend imports the module API and never needed the global.
+- A real CSP is configured, replacing `csp: null`:
+  `default-src 'self'`, `script-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`,
+  with `'unsafe-inline'` kept for `style-src` only because Vite injects style tags in dev.
+
+Two things worth knowing about the CSP:
+
+- **It does not apply in `tauri dev`.** Tauri injects the CSP header only for assets it serves
+  itself; in dev the page comes from the Vite server. Only `tauri build` output is protected,
+  so CSP changes have to be checked against a production build.
+- Tauri's IPC uses `fetch()` to `ipc://localhost` on macOS, which *is* subject to
+  `connect-src` — hence the `ipc:` source. If that source were wrong, Tauri catches the CSP
+  error and silently falls back to the `postMessage` interface, so a mistake here degrades
+  performance and logs a console warning rather than breaking the app.
+
+## 9. Assorted smaller items — Partly fixed
+
+**Fixed:**
+
+- **`read_image_info` no longer fully decodes each image.** It goes through `into_decoder()`
+  and reads `dimensions()` from the header, so adding a few hundred files no longer decodes
+  and holds a few hundred images. (It also reads orientation there — see item 7.)
+- **Load errors are surfaced.** `loadImages` now separates successes, duplicates and failures
+  and reports all three in the status line, naming up to three failed files and counting the
+  rest. Previously every `Err` from `get_images_info` was dropped and the file just silently
+  didn't appear.
+- **Tests exist.** 20 of them, described under "Verification status" at the top.
+
+**Still open:**
 
 - **No progress or cancel.** A batch is a single `invoke` with a static "Converting N
   images..." message and no way to stop. Emitting a Tauri event per completed file would
-  give a real progress bar cheaply, and matters most for slow formats (item 4).
-- **`read_image_info` fully decodes each image** just to read width and height.
-  `ImageReader::into_dimensions()` is dramatically cheaper and avoids holding large
-  decoded buffers when someone adds a few hundred files.
-- **Load errors are silently discarded.** `get_images_info` returns
-  `Vec<Result<ImageInfo, String>>`, and the frontend drops every `Err` without telling
-  anyone. Files that fail to load just quietly don't appear in the list.
-- **No tests.** `get_output_path` is pure, has real branching (three output modes, format
-  normalisation, collision handling, reservation) and is the function most likely to
-  cause data loss if it regresses. It should have unit tests.
+  give a real progress bar cheaply, and matters most for AVIF, which is slow (item 4).
 - **No HEIC support.** Not a bug, but it is what every iPhone photo is, and its absence is
   conspicuous in a macOS image tool.
+- **No frontend tests.** The XSS fix in item 8, the status-line logic and `isSupportedImage`
+  are all plain functions that vitest + jsdom could cover. Nothing is installed today.
+
+---
+
+## Needs manual verification
+
+Automated tests cover the Rust conversion logic only. These need a human with the app open,
+and none of them have been confirmed since the changes above:
+
+1. **Drag and drop** — still unverified from the original item 3 fix. Drop files anywhere on
+   the window; they should be added. Dropped folders should be ignored, not expanded.
+2. **A conversion end to end** — add a file, pick a format, convert. This is the only real
+   check that IPC works under the new CSP. If the CSP were wrong the app would still work via
+   the postMessage fallback, so also worth opening the webview inspector and confirming there
+   is no "IPC custom protocol failed" warning.
+3. **The WebP quality slider** — it now appears for WebP, where it previously did not. Confirm
+   it is visible and that a lower value produces a smaller file.
+4. **A rotated photo** — convert a photo straight off an iPhone and confirm the output is
+   upright and that the dimensions in the file list match the output.
+5. **Replace mode on a throwaway copy** — confirm the original is replaced correctly and no
+   `.tmp` files are left in the folder. Use a copy; this is the destructive path.
+6. **A file with `<` or `>` in its name** — e.g. `<img src=x onerror=alert(1)>.png`. The name
+   should appear as literal text in the list.
+7. **Errors are visible** — add a `.png` that isn't really a PNG and confirm the status line
+   names it instead of silently skipping it.
+
+Note that a production build (`npm run tauri build`) is required to test anything CSP-related;
+`tauri dev` does not apply the CSP at all.
 
 ---
 

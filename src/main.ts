@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 
+// Input formats only. AVIF is absent on purpose — it is an output-only format here,
+// because decoding it needs the image crate's non-default avif-native feature.
 const IMAGE_EXTENSIONS = [
   "png",
   "jpg",
@@ -12,7 +14,6 @@ const IMAGE_EXTENSIONS = [
   "ico",
   "tiff",
   "tif",
-  "avif",
 ];
 
 interface ImageInfo {
@@ -106,9 +107,13 @@ async function init() {
 }
 
 function populateFormatSelect() {
-  formatSelect.innerHTML = outputFormats
-    .map((f) => `<option value="${f.extension}">${f.name}</option>`)
-    .join("");
+  formatSelect.textContent = "";
+  for (const f of outputFormats) {
+    const option = document.createElement("option");
+    option.value = f.extension;
+    option.textContent = f.name;
+    formatSelect.append(option);
+  }
 }
 
 function setupEventListeners() {
@@ -141,6 +146,10 @@ async function selectFiles() {
     console.error("Failed to open file dialog:", error);
     showStatus(`Failed to open file dialog: ${error}`, "error");
   }
+}
+
+function basename(path: string): string {
+  return path.split(/[/\\]/).pop() || path;
 }
 
 function isSupportedImage(path: string): boolean {
@@ -180,22 +189,39 @@ async function loadImages(paths: string[]) {
     const results = await invoke<({ Ok: ImageInfo } | { Err: string })[]>("get_images_info", { paths });
 
     let loadedCount = 0;
-    for (const result of results) {
+    let duplicateCount = 0;
+    const failed: string[] = [];
+
+    results.forEach((result, index) => {
       if ("Ok" in result) {
         const info = result.Ok;
-        if (!selectedImages.some((img) => img.path === info.path)) {
+        if (selectedImages.some((img) => img.path === info.path)) {
+          duplicateCount++;
+        } else {
           selectedImages.push(info);
           loadedCount++;
         }
+      } else {
+        // Files that fail to load used to vanish without explanation.
+        failed.push(basename(paths[index]));
       }
-    }
+    });
 
     updateUI();
 
-    if (loadedCount > 0) {
-      showStatus(`Added ${loadedCount} image${loadedCount > 1 ? "s" : ""}`, "success");
-    } else {
+    const parts: string[] = [];
+    if (loadedCount > 0) parts.push(`Added ${loadedCount} image${loadedCount > 1 ? "s" : ""}`);
+    if (duplicateCount > 0) parts.push(`${duplicateCount} already in the list`);
+    if (failed.length > 0) {
+      const shown = failed.slice(0, 3).join(", ");
+      const rest = failed.length > 3 ? ` and ${failed.length - 3} more` : "";
+      parts.push(`could not read ${shown}${rest}`);
+    }
+
+    if (parts.length === 0) {
       showStatus("No new images added", "info");
+    } else {
+      showStatus(parts.join(" · "), failed.length > 0 ? "error" : "success");
     }
   } catch (error) {
     console.error("Failed to load images:", error);
@@ -216,27 +242,40 @@ function updateUI() {
   updateFolderVisibility();
 }
 
+// Filenames are attacker-controlled enough to matter: a file named
+// `<img src=x onerror=...>.png` would execute if interpolated into innerHTML. Everything
+// here is built as DOM nodes with textContent so filename bytes are never parsed as markup.
 function renderFileList() {
-  fileList.innerHTML = selectedImages
-    .map(
-      (img, index) => `
-      <div class="file-item">
-        <div class="file-info">
-          <span class="file-name">${img.name}</span>
-          <span class="file-meta">${img.width}x${img.height} · ${img.format} · ${formatBytes(img.size_bytes)}</span>
-        </div>
-        <button class="remove-btn" data-index="${index}" title="Remove">×</button>
-      </div>
-    `
-    )
-    .join("");
+  fileList.textContent = "";
 
-  fileList.querySelectorAll(".remove-btn").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      const index = parseInt((e.target as HTMLElement).dataset.index!);
+  selectedImages.forEach((img, index) => {
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = img.name;
+    name.title = img.path;
+
+    const meta = document.createElement("span");
+    meta.className = "file-meta";
+    meta.textContent = `${img.width}x${img.height} · ${img.format} · ${formatBytes(img.size_bytes)}`;
+
+    const info = document.createElement("div");
+    info.className = "file-info";
+    info.append(name, meta);
+
+    const remove = document.createElement("button");
+    remove.className = "remove-btn";
+    remove.title = "Remove";
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
       selectedImages.splice(index, 1);
       updateUI();
     });
+
+    const item = document.createElement("div");
+    item.className = "file-item";
+    item.append(info, remove);
+
+    fileList.append(item);
   });
 }
 
