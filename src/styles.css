@@ -239,6 +239,10 @@ input[type="range"]::-webkit-slider-thumb {
   gap: 4px;
 }
 
+.file-item.selected {
+  background: #eaf3ff;
+}
+
 .checkbox-label {
   display: flex;
   align-items: center;
@@ -264,6 +268,150 @@ input[type="range"]::-webkit-slider-thumb {
 
 .option-hint:empty {
   display: none;
+}
+
+/* Resize */
+.resize-container {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.resize-container input[type="number"] {
+  width: 82px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+  color: inherit;
+}
+
+.dim-x {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+/* A follow-on row of checkboxes belonging to the control above it. */
+.sub-row {
+  margin-top: -8px;
+}
+
+.sub-row .checkbox-container {
+  flex-direction: row;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+/* Crop */
+#crop-editor {
+  margin: 0 0 16px 120px;
+}
+
+.crop-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 6px;
+  line-height: 0;
+  /* The checkerboard makes transparent regions obvious while framing a crop. */
+  background-image: linear-gradient(45deg, #e0e0e0 25%, transparent 25%),
+    linear-gradient(-45deg, #e0e0e0 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #e0e0e0 75%),
+    linear-gradient(-45deg, transparent 75%, #e0e0e0 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  touch-action: none;
+}
+
+#crop-preview {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.crop-box {
+  position: absolute;
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  outline: 1px solid rgba(0, 0, 0, 0.5);
+  cursor: move;
+  /* Darkens everything outside the selection; the stage clips the overflow. */
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+  box-sizing: border-box;
+}
+
+.crop-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border: 1px solid #4a9eff;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+.crop-handle.nw { top: -6px; left: -6px; cursor: nwse-resize; }
+.crop-handle.ne { top: -6px; right: -6px; cursor: nesw-resize; }
+.crop-handle.sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.crop-handle.se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.crop-handle.n { top: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+.crop-handle.s { bottom: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
+.crop-handle.w { left: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
+.crop-handle.e { right: -6px; top: 50%; margin-top: -6px; cursor: ew-resize; }
+
+.crop-caption {
+  margin: 8px 0 0;
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.crop-fields {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.crop-fields label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: auto !important;
+  font-size: 0.8rem;
+  font-weight: 400 !important;
+  color: #666;
+}
+
+.crop-fields input {
+  width: 64px;
+  padding: 5px 7px;
+  font-size: 0.8rem;
+  border: 1px solid #ddd;
+  border-radius: 5px;
+  background: #fff;
+  color: inherit;
+}
+
+/* Size estimate */
+.estimate {
+  margin: 0 0 12px;
+  font-size: 0.85rem;
+  color: #666;
+  text-align: center;
+}
+
+.estimate:empty {
+  display: none;
+}
+
+.estimate .estimate-value {
+  font-weight: 600;
+  color: #333;
 }
 
 /* Buttons */
@@ -383,8 +531,36 @@ input[type="range"]::-webkit-slider-thumb {
     color: #e0e0e0;
   }
 
-  .option-hint {
+  .option-hint,
+  .crop-caption,
+  .crop-fields label {
     color: #999;
+  }
+
+  .resize-container input[type="number"],
+  .crop-fields input {
+    background: #333;
+    border-color: #555;
+    color: #e0e0e0;
+  }
+
+  .crop-stage {
+    background-image: linear-gradient(45deg, #3a3a3a 25%, transparent 25%),
+      linear-gradient(-45deg, #3a3a3a 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #3a3a3a 75%),
+      linear-gradient(-45deg, transparent 75%, #3a3a3a 75%);
+  }
+
+  .estimate {
+    color: #aaa;
+  }
+
+  .estimate .estimate-value {
+    color: #e8e8e8;
+  }
+
+  .file-item.selected {
+    background: #34445c;
   }
 
   input[type="range"] {

@@ -22,4 +22,5 @@ tauri-plugin-dialog = "2.6.0"
 rayon = "1"
 webp = "0.3.1"
 img-parts = "0.4.0"
+base64 = "0.23.0"
 

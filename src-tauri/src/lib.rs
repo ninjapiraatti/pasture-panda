@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use image::{
     codecs::jpeg::JpegEncoder, metadata::Orientation, ImageDecoder, ImageFormat, ImageReader,
 };
@@ -34,12 +36,164 @@ pub struct ImageInfo {
     size_bytes: u64,
 }
 
+/// A crop region expressed as percentages of the source image, so one rectangle can apply
+/// to a batch of differently sized images.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct CropRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl CropRect {
+    /// A crop covering the whole frame is a no-op worth skipping.
+    fn is_full_frame(&self) -> bool {
+        self.x <= 0.0 && self.y <= 0.0 && self.width >= 100.0 && self.height >= 100.0
+    }
+
+    /// Resolves to pixel bounds inside a `w` x `h` image.
+    ///
+    /// Everything is clamped to stay in bounds and to keep at least one pixel, because the
+    /// rectangle comes from the UI and `crop_imm` panics on out-of-range values.
+    fn to_pixels(self, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        let frac = |v: f32| f32::from(v.is_finite()) * v.clamp(0.0, 100.0) / 100.0;
+        let x = (frac(self.x) * w as f32).round() as u32;
+        let y = (frac(self.y) * h as f32).round() as u32;
+        let cw = (frac(self.width) * w as f32).round() as u32;
+        let ch = (frac(self.height) * h as f32).round() as u32;
+
+        // Leave room for at least one pixel of image after the offset.
+        let x = x.min(w - 1);
+        let y = y.min(h - 1);
+        let cw = cw.max(1).min(w - x);
+        let ch = ch.max(1).min(h - y);
+
+        Some((x, y, cw, ch))
+    }
+}
+
+/// Target size for the output.
+///
+/// `preserve_aspect` is the default: the image is fitted inside whichever bounds are given.
+/// With it off, each axis is set independently and the image is stretched — "free resizing".
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+pub struct ResizeOptions {
+    width: Option<u32>,
+    height: Option<u32>,
+    preserve_aspect: bool,
+    no_upscale: bool,
+}
+
+impl ResizeOptions {
+    /// Target dimensions for a `w` x `h` input, or `None` when this is a no-op.
+    fn target_for(&self, w: u32, h: u32) -> Option<(u32, u32)> {
+        if w == 0 || h == 0 || (self.width.is_none() && self.height.is_none()) {
+            return None;
+        }
+
+        let (tw, th) = if self.preserve_aspect {
+            // One scale factor for both axes: the tightest of the given bounds.
+            let scale = match (self.width, self.height) {
+                (Some(bw), None) => f64::from(bw) / f64::from(w),
+                (None, Some(bh)) => f64::from(bh) / f64::from(h),
+                (Some(bw), Some(bh)) => {
+                    (f64::from(bw) / f64::from(w)).min(f64::from(bh) / f64::from(h))
+                }
+                (None, None) => unreachable!("guarded above"),
+            };
+            let scale = if self.no_upscale { scale.min(1.0) } else { scale };
+            (
+                ((f64::from(w) * scale).round() as u32).max(1),
+                ((f64::from(h) * scale).round() as u32).max(1),
+            )
+        } else {
+            // Free resize: an axis left blank keeps the source's own size.
+            let mut tw = self.width.unwrap_or(w).max(1);
+            let mut th = self.height.unwrap_or(h).max(1);
+            if self.no_upscale {
+                tw = tw.min(w);
+                th = th.min(h);
+            }
+            (tw, th)
+        };
+
+        if (tw, th) == (w, h) {
+            None
+        } else {
+            Some((tw, th))
+        }
+    }
+}
+
+/// The dimensions an input of `w` x `h` will end up with. Pure maths, no decoding, so the UI
+/// can call this on every keystroke — and so there is exactly one implementation of the rules
+/// rather than one in Rust and a drifting copy in TypeScript.
+fn planned_dimensions(
+    w: u32,
+    h: u32,
+    crop: Option<&CropRect>,
+    resize: Option<&ResizeOptions>,
+) -> (u32, u32) {
+    let (mut w, mut h) = (w, h);
+
+    if let Some(crop) = crop {
+        if !crop.is_full_frame() {
+            if let Some((_, _, cw, ch)) = crop.to_pixels(w, h) {
+                (w, h) = (cw, ch);
+            }
+        }
+    }
+
+    if let Some(resize) = resize {
+        if let Some((tw, th)) = resize.target_for(w, h) {
+            (w, h) = (tw, th);
+        }
+    }
+
+    (w, h)
+}
+
+/// Applies crop then resize. Order matters: cropping first means the resize bounds describe
+/// the visible region, which is what someone adjusting both would expect.
+fn apply_transforms(
+    mut img: image::DynamicImage,
+    crop: Option<&CropRect>,
+    resize: Option<&ResizeOptions>,
+) -> image::DynamicImage {
+    if let Some(crop) = crop {
+        if !crop.is_full_frame() {
+            if let Some((x, y, cw, ch)) = crop.to_pixels(img.width(), img.height()) {
+                img = img.crop_imm(x, y, cw, ch);
+            }
+        }
+    }
+
+    if let Some(resize) = resize {
+        if let Some((tw, th)) = resize.target_for(img.width(), img.height()) {
+            // Lanczos3 is the best of the crate's filters for downscaling photographs, which
+            // is what this is overwhelmingly used for.
+            img = img.resize_exact(tw, th, image::imageops::FilterType::Lanczos3);
+        }
+    }
+
+    img
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConversionOptions {
     format: String,
     quality: u8,
     output_mode: OutputMode,
     output_folder: Option<String>,
+    #[serde(default)]
+    crop: Option<CropRect>,
+    #[serde(default)]
+    resize: Option<ResizeOptions>,
     /// Carry Exif/ICC from the source into the output where the container allows it.
     /// Defaults to true so that stripping metadata is always a deliberate choice.
     #[serde(default = "default_preserve_metadata")]
@@ -400,13 +554,17 @@ fn encode_to_bytes(
     img: &image::DynamicImage,
     options: &ConversionOptions,
 ) -> Result<Vec<u8>, String> {
+    let format = options.format.to_lowercase();
+    let img = normalise_for_format(img, &format);
+    let img = img.as_ref();
+
     let write_with = |format: ImageFormat| {
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, format).map_err(|e| e.to_string())?;
         Ok(buf.into_inner())
     };
 
-    match options.format.to_lowercase().as_str() {
+    match format.as_str() {
         "jpg" | "jpeg" => {
             let mut buf = Vec::new();
             let encoder = JpegEncoder::new_with_quality(&mut buf, options.quality);
@@ -421,6 +579,44 @@ fn encode_to_bytes(
         "tiff" => write_with(ImageFormat::Tiff),
         other => Err(format!("Unsupported format: {}", other)),
     }
+}
+
+/// Converts to a colour type the target encoder will actually accept.
+///
+/// The crate's encoders each support a different subset and fail at encode time with an opaque
+/// message rather than converting — a greyscale PNG converted to GIF died with "the encoder or
+/// decoder for Gif does not support the color type `L8`". Converting up front turns that class
+/// of failure into a working conversion.
+fn normalise_for_format<'a>(
+    img: &'a image::DynamicImage,
+    format: &str,
+) -> std::borrow::Cow<'a, image::DynamicImage> {
+    use image::ColorType::{La16, La8, L8, Rgb8, Rgba16, Rgba8};
+
+    let color = img.color();
+    let acceptable = match format {
+        // Broad support, including 16-bit and greyscale.
+        "png" | "tiff" => true,
+        // encode_webp picks RGB or RGBA itself.
+        "webp" => true,
+        "jpg" | "jpeg" => matches!(color, L8 | Rgb8 | Rgba8),
+        "bmp" => matches!(color, L8 | Rgb8 | Rgba8),
+        "gif" | "avif" => matches!(color, Rgb8 | Rgba8),
+        _ => true,
+    };
+
+    if acceptable {
+        return std::borrow::Cow::Borrowed(img);
+    }
+
+    // Keep alpha where the source had it and the format can express it; JPEG cannot.
+    let keeps_alpha =
+        matches!(color, Rgba8 | Rgba16 | La8 | La16) && !matches!(format, "jpg" | "jpeg");
+    std::borrow::Cow::Owned(if keeps_alpha {
+        image::DynamicImage::ImageRgba8(img.to_rgba8())
+    } else {
+        image::DynamicImage::ImageRgb8(img.to_rgb8())
+    })
 }
 
 /// Temporary path used to stage an encode next to its final destination, so the rename
@@ -455,6 +651,8 @@ fn convert_single_image(
         Ok(decoded) => decoded,
         Err(e) => return failure(format!("Failed to open image: {}", e)),
     };
+
+    let img = apply_transforms(img, options.crop.as_ref(), options.resize.as_ref());
 
     let mut encoded = match encode_to_bytes(&img, options) {
         Ok(bytes) => bytes,
@@ -545,6 +743,363 @@ async fn convert_images(paths: Vec<String>, options: ConversionOptions) -> Batch
     }
 }
 
+/// Longest edge of the preview image handed to the crop UI.
+const THUMBNAIL_MAX_EDGE: u32 = 900;
+
+/// Edge length of each native-resolution sample tile used for size estimation, and the grid
+/// they are taken on (2x2 = four tiles, one per quadrant).
+///
+/// Tiles are cut at *native* resolution rather than downscaled from the whole image. That
+/// distinction is the difference between a usable estimate and a useless one: downscaling
+/// averages away high-frequency detail, so a shrunken copy of a photo compresses far better
+/// per pixel than the original and extrapolating from it underestimates badly — measured at
+/// -50% to -84% on detailed images. A native tile has the same detail character as the source,
+/// so bytes-per-pixel carries across.
+const SAMPLE_TILE_EDGE: u32 = 256;
+const SAMPLE_GRID: u32 = 2;
+
+/// Longest edge of the whole-image proxy kept alongside the tiles.
+///
+/// When the requested output fits inside this, the proxy is resized to the exact output size
+/// and encoded whole — no extrapolation, so the estimate is near-exact. Extrapolating from
+/// tiles is only used for outputs larger than this, where tiles stay big enough to be
+/// representative. Heavy downscales were the tile approach's weak spot: a 17x reduction
+/// shrinks a 256px tile to 15px, and per-pixel cost at that size stopped tracking reality,
+/// overestimating by up to 89%.
+const SAMPLE_PROXY_EDGE: u32 = 640;
+
+/// An orientation-corrected preview as a PNG data URI, for the crop overlay to draw on.
+///
+/// Orientation matters here: the crop rectangle is expressed against what the user sees, so
+/// the preview has to be rotated the same way the output will be.
+#[tauri::command]
+async fn get_thumbnail(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (img, _) = decode_oriented(&path)?;
+
+        // Only shrink. `thumbnail` would otherwise enlarge a small image to fill the box,
+        // producing a blurry preview and a needlessly large data URI.
+        let thumb = if img.width() > THUMBNAIL_MAX_EDGE || img.height() > THUMBNAIL_MAX_EDGE {
+            img.thumbnail(THUMBNAIL_MAX_EDGE, THUMBNAIL_MAX_EDGE)
+        } else {
+            img
+        };
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        thumb
+            .write_to(&mut buf, ImageFormat::Png)
+            .map_err(|e| format!("Failed to encode thumbnail: {}", e))?;
+
+        Ok(format!(
+            "data:image/png;base64,{}",
+            BASE64.encode(buf.into_inner())
+        ))
+    })
+    .await
+    .map_err(|e| format!("Failed to build thumbnail: {}", e))?
+}
+
+/// What is kept in memory per source image to estimate output sizes without re-decoding:
+/// native-resolution tiles for large outputs, and a whole-image proxy for small ones.
+struct EstimationSample {
+    tiles: Vec<image::DynamicImage>,
+    proxy: image::DynamicImage,
+    source_width: u32,
+    source_height: u32,
+    /// True when the source was small enough that the proxy *is* the source, which makes any
+    /// estimate derived from it exact.
+    whole_image: bool,
+}
+
+/// Derives both the tiles and the proxy from one decode.
+fn build_sample(img: &image::DynamicImage) -> EstimationSample {
+    let (w, h) = (img.width(), img.height());
+
+    // `thumbnail` scales to *fit* the box, which means it enlarges anything smaller. An
+    // upscaled proxy then gets scaled back down for the estimate, and the double resample
+    // softened the image enough to underestimate by 30%.
+    let whole_image = w <= SAMPLE_PROXY_EDGE && h <= SAMPLE_PROXY_EDGE;
+    let proxy = if whole_image {
+        img.clone()
+    } else {
+        img.thumbnail(SAMPLE_PROXY_EDGE, SAMPLE_PROXY_EDGE)
+    };
+
+    // Small enough that sampling the whole thing is cheaper than slicing it up.
+    if w <= SAMPLE_TILE_EDGE * SAMPLE_GRID && h <= SAMPLE_TILE_EDGE * SAMPLE_GRID {
+        return EstimationSample {
+            tiles: vec![img.clone()],
+            proxy,
+            source_width: w,
+            source_height: h,
+            whole_image,
+        };
+    }
+
+    let tw = SAMPLE_TILE_EDGE.min(w / SAMPLE_GRID).max(1);
+    let th = SAMPLE_TILE_EDGE.min(h / SAMPLE_GRID).max(1);
+
+    let mut tiles = Vec::with_capacity((SAMPLE_GRID * SAMPLE_GRID) as usize);
+    for gy in 0..SAMPLE_GRID {
+        for gx in 0..SAMPLE_GRID {
+            // Centre of this grid cell, then step back half a tile to centre the tile on it.
+            let cx = (2 * gx + 1) * w / (2 * SAMPLE_GRID);
+            let cy = (2 * gy + 1) * h / (2 * SAMPLE_GRID);
+            let x = cx.saturating_sub(tw / 2).min(w - tw);
+            let y = cy.saturating_sub(th / 2).min(h - th);
+            tiles.push(img.crop_imm(x, y, tw, th));
+        }
+    }
+
+    EstimationSample {
+        tiles,
+        proxy,
+        source_width: w,
+        source_height: h,
+        whole_image,
+    }
+}
+
+/// Samples are cached because decoding is the expensive part of estimating. Without this,
+/// every quality-slider nudge would re-decode every original.
+#[derive(Default)]
+struct ProxyCache(
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<EstimationSample>>>,
+);
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SizeEstimate {
+    /// Sum of estimated output sizes, in bytes.
+    estimated_bytes: u64,
+    /// Sum of the input file sizes, for comparison.
+    source_bytes: u64,
+    /// How many inputs contributed. Files that could not be read are excluded.
+    counted: usize,
+    /// Inputs that could not be estimated at all.
+    failed: usize,
+    /// False when every sample covered its whole source, i.e. the figure is near-exact.
+    approximate: bool,
+}
+
+/// Estimates total output size by encoding a small proxy at the chosen settings and scaling
+/// the result by the pixel ratio.
+///
+/// This is an estimate, not a measurement. Compression ratio does not scale perfectly with
+/// pixel count — fine detail behaves differently at different scales — so treat it as
+/// roughly +/-20% for photographic content, and worse for synthetic images.
+#[tauri::command]
+async fn estimate_output_size(
+    paths: Vec<String>,
+    options: ConversionOptions,
+    cache: tauri::State<'_, ProxyCache>,
+) -> Result<SizeEstimate, String> {
+    // Reuse cached proxies, decode whatever is missing.
+    let mut proxies: Vec<(String, std::sync::Arc<EstimationSample>)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    {
+        let map = cache.0.lock().map_err(|_| "proxy cache poisoned")?;
+        for path in &paths {
+            match map.get(path) {
+                Some(proxy) => proxies.push((path.clone(), proxy.clone())),
+                None => missing.push(path.clone()),
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let decoded = tauri::async_runtime::spawn_blocking(move || {
+            missing
+                .par_iter()
+                .map(|path| {
+                    let sample = decode_oriented(path).map(|(img, _)| build_sample(&img));
+                    (path.clone(), sample)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| format!("Failed to prepare estimate: {}", e))?;
+
+        let mut map = cache.0.lock().map_err(|_| "proxy cache poisoned")?;
+        for (path, sample) in decoded {
+            if let Ok(sample) = sample {
+                let sample = std::sync::Arc::new(sample);
+                map.insert(path.clone(), sample.clone());
+                proxies.push((path, sample));
+            }
+        }
+        // Keep the cache bounded to the current selection rather than growing for the life
+        // of the process.
+        let keep: std::collections::HashSet<&String> = paths.iter().collect();
+        map.retain(|k, _| keep.contains(k));
+    }
+
+    let source_bytes: u64 = paths
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let failed = paths.len() - proxies.len();
+    let approximate = proxies.iter().any(|(_, s)| !s.whole_image);
+
+    let estimated_bytes = tauri::async_runtime::spawn_blocking(move || {
+        proxies
+            .par_iter()
+            .filter_map(|(_, sample)| estimate_one(sample, &options))
+            .sum::<u64>()
+    })
+    .await
+    .map_err(|e| format!("Failed to estimate size: {}", e))?;
+
+    Ok(SizeEstimate {
+        estimated_bytes,
+        source_bytes,
+        counted: paths.len() - failed,
+        failed,
+        approximate,
+    })
+}
+
+/// Measures bytes-per-pixel on the sample tiles and multiplies by the real output's pixel count.
+///
+/// The tiles are scaled by the *same factor* the full image will undergo, so they carry the
+/// detail loss that resizing causes. Encoding tiles at native scale and extrapolating from
+/// there is what makes the estimate track reality; see [`SAMPLE_TILE_EDGE`].
+fn estimate_one(sample: &EstimationSample, options: &ConversionOptions) -> Option<u64> {
+    let (out_w, out_h) = planned_dimensions(
+        sample.source_width,
+        sample.source_height,
+        options.crop.as_ref(),
+        options.resize.as_ref(),
+    );
+    let out_pixels = u64::from(out_w) * u64::from(out_h);
+    if out_pixels == 0 {
+        return None;
+    }
+
+    // The cropped region is what gets resized, so the output's scale factor is measured
+    // against the crop, not the original frame.
+    let (crop_w, crop_h) = options
+        .crop
+        .as_ref()
+        .filter(|c| !c.is_full_frame())
+        .and_then(|c| c.to_pixels(sample.source_width, sample.source_height))
+        .map_or(
+            (sample.source_width, sample.source_height),
+            |(_, _, cw, ch)| (cw, ch),
+        );
+
+    // When the output fits inside the proxy, encode the whole proxy at the exact output size.
+    // No extrapolation is involved, so this is as close to measuring as estimating gets — and
+    // it is exactly the heavy-downscale case that tile extrapolation handled worst.
+    if out_w <= sample.proxy.width() && out_h <= sample.proxy.height() {
+        let cropped = apply_transforms(sample.proxy.clone(), options.crop.as_ref(), None);
+        // Resampling at identical dimensions is not a no-op — Lanczos3 would soften the image
+        // and change its encoded size — so only resize when the size actually differs.
+        let scaled = if (cropped.width(), cropped.height()) == (out_w, out_h) {
+            cropped
+        } else {
+            cropped.resize_exact(out_w, out_h, image::imageops::FilterType::Lanczos3)
+        };
+        return encode_to_bytes(&scaled, options).ok().map(|b| b.len() as u64);
+    }
+
+    let sx = f64::from(out_w) / f64::from(crop_w.max(1));
+    let sy = f64::from(out_h) / f64::from(crop_h.max(1));
+
+    // Scale every tile by the factor the real image gets, then stitch them into one sample.
+    // Stitching matters at heavy downscales: four separate 32px encodes pay four lots of
+    // container overhead on almost no data, which is where the estimate went most wrong.
+    let scaled: Vec<image::DynamicImage> = sample
+        .tiles
+        .iter()
+        .map(|tile| {
+            let tw = ((f64::from(tile.width()) * sx).round() as u32).max(1);
+            let th = ((f64::from(tile.height()) * sy).round() as u32).max(1);
+            if (tw, th) == (tile.width(), tile.height()) {
+                tile.clone()
+            } else {
+                tile.resize_exact(tw, th, image::imageops::FilterType::Lanczos3)
+            }
+        })
+        .collect();
+
+    let stitched = stitch_tiles(&scaled)?;
+    let pixels = u64::from(stitched.width()) * u64::from(stitched.height());
+    if pixels == 0 {
+        return None;
+    }
+
+    let bytes = encode_to_bytes(&stitched, options).ok()?.len() as u64;
+
+    // Split the measurement into fixed container cost and per-pixel data cost. Without this
+    // the estimate inflates on downscales, where headers and quantisation tables dominate the
+    // sample's bytes and multiplying that per-pixel figure up overestimates badly.
+    let overhead = container_overhead(options);
+    let data_per_pixel = bytes.saturating_sub(overhead) as f64 / pixels as f64;
+
+    Some(overhead + (data_per_pixel * out_pixels as f64) as u64)
+}
+
+/// Lays tiles out in a `SAMPLE_GRID`-wide mosaic so they can be encoded as one image.
+///
+/// The canvas keeps the tiles' own colour type. Normalising to RGB would wreck the estimate:
+/// a greyscale source encoded as RGB costs roughly three times the bytes per pixel, which
+/// showed up as a +204% overestimate on a greyscale PNG before this was fixed.
+fn stitch_tiles(tiles: &[image::DynamicImage]) -> Option<image::DynamicImage> {
+    let first = tiles.first()?;
+    if tiles.len() == 1 {
+        return Some(first.clone());
+    }
+
+    let (tw, th) = (first.width(), first.height());
+    let cols = SAMPLE_GRID;
+    let rows = (tiles.len() as u32).div_ceil(cols);
+
+    let mut canvas = image::DynamicImage::new(tw * cols, th * rows, first.color());
+    for (i, tile) in tiles.iter().enumerate() {
+        let x = (i as u32 % cols) * tw;
+        let y = (i as u32 / cols) * th;
+        image::imageops::replace(&mut canvas, tile, i64::from(x), i64::from(y));
+    }
+
+    Some(canvas)
+}
+
+/// Bytes a container costs before any image data: signatures, headers, quantisation tables,
+/// palettes. Measured rather than assumed, since it varies by format and quality.
+fn container_overhead(options: &ConversionOptions) -> u64 {
+    let flat = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        8,
+        8,
+        image::Rgb([128, 128, 128]),
+    ));
+    encode_to_bytes(&flat, options).map_or(0, |b| b.len() as u64)
+}
+
+/// Source dimensions paired with what they will become after crop and resize.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlannedSize {
+    width: u32,
+    height: u32,
+}
+
+/// Pure maths — no image is opened — so the UI can call this freely while someone types in
+/// the resize fields or drags the crop box.
+#[tauri::command]
+fn plan_output_dimensions(
+    sources: Vec<PlannedSize>,
+    crop: Option<CropRect>,
+    resize: Option<ResizeOptions>,
+) -> Vec<PlannedSize> {
+    sources
+        .into_iter()
+        .map(|source| {
+            let (width, height) =
+                planned_dimensions(source.width, source.height, crop.as_ref(), resize.as_ref());
+            PlannedSize { width, height }
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn get_supported_input_formats() -> Vec<String> {
     vec![
@@ -596,10 +1151,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(ProxyCache::default())
         .invoke_handler(tauri::generate_handler![
             get_image_info,
             get_images_info,
             convert_images,
+            get_thumbnail,
+            plan_output_dimensions,
+            estimate_output_size,
             get_supported_input_formats,
             get_supported_output_formats
         ])
@@ -630,7 +1189,36 @@ mod tests {
             quality: 85,
             output_mode,
             output_folder: None,
+            crop: None,
+            resize: None,
             preserve_metadata: true,
+        }
+    }
+
+    fn fit(width: Option<u32>, height: Option<u32>) -> ResizeOptions {
+        ResizeOptions {
+            width,
+            height,
+            preserve_aspect: true,
+            no_upscale: false,
+        }
+    }
+
+    fn stretch(width: Option<u32>, height: Option<u32>) -> ResizeOptions {
+        ResizeOptions {
+            width,
+            height,
+            preserve_aspect: false,
+            no_upscale: false,
+        }
+    }
+
+    fn crop(x: f32, y: f32, width: f32, height: f32) -> CropRect {
+        CropRect {
+            x,
+            y,
+            width,
+            height,
         }
     }
 
@@ -1285,6 +1873,662 @@ mod tests {
         }
         for ext in ["avif", "gif", "bmp", "tiff"] {
             assert!(!supports(ext), "{} does not carry metadata here", ext);
+        }
+    }
+
+    // --- resize maths ---
+
+    #[test]
+    fn aspect_preserving_resize_fits_inside_the_given_box() {
+        // 2000x1000 into a 1000x1000 box: width binds, height follows the ratio.
+        assert_eq!(fit(Some(1000), Some(1000)).target_for(2000, 1000), Some((1000, 500)));
+        // Tall source into the same box: now height binds.
+        assert_eq!(fit(Some(1000), Some(1000)).target_for(1000, 2000), Some((500, 1000)));
+    }
+
+    #[test]
+    fn a_single_bound_scales_the_other_axis() {
+        assert_eq!(fit(Some(800), None).target_for(1600, 1200), Some((800, 600)));
+        assert_eq!(fit(None, Some(600)).target_for(1600, 1200), Some((800, 600)));
+    }
+
+    #[test]
+    fn free_resize_stretches_to_exactly_what_was_asked() {
+        assert_eq!(stretch(Some(300), Some(300)).target_for(1600, 1200), Some((300, 300)));
+    }
+
+    #[test]
+    fn free_resize_leaves_a_blank_axis_alone() {
+        assert_eq!(stretch(Some(300), None).target_for(1600, 1200), Some((300, 1200)));
+        assert_eq!(stretch(None, Some(300)).target_for(1600, 1200), Some((1600, 300)));
+    }
+
+    #[test]
+    fn no_upscale_never_enlarges() {
+        let mut opts = fit(Some(4000), Some(4000));
+        opts.no_upscale = true;
+        assert_eq!(opts.target_for(1000, 500), None, "should stay at source size");
+
+        let mut free = stretch(Some(4000), Some(4000));
+        free.no_upscale = true;
+        assert_eq!(free.target_for(1000, 500), None);
+
+        // Without the flag, enlarging is allowed.
+        assert_eq!(fit(Some(4000), Some(4000)).target_for(1000, 500), Some((4000, 2000)));
+    }
+
+    #[test]
+    fn a_resize_to_the_current_size_is_a_no_op() {
+        assert_eq!(fit(Some(1600), Some(1200)).target_for(1600, 1200), None);
+        assert_eq!(stretch(Some(1600), Some(1200)).target_for(1600, 1200), None);
+    }
+
+    #[test]
+    fn resize_never_produces_a_zero_dimension() {
+        // An extreme downscale of a very wide image would round the short axis to zero.
+        let (w, h) = fit(Some(1), None).target_for(10_000, 3).unwrap();
+        assert!(w >= 1 && h >= 1, "got {}x{}", w, h);
+    }
+
+    // --- crop maths ---
+
+    #[test]
+    fn percentage_crop_resolves_against_each_image_size() {
+        // The same rectangle on two different sources — the point of storing percentages.
+        assert_eq!(crop(10.0, 10.0, 80.0, 80.0).to_pixels(1000, 1000), Some((100, 100, 800, 800)));
+        assert_eq!(crop(10.0, 10.0, 80.0, 80.0).to_pixels(400, 200), Some((40, 20, 320, 160)));
+    }
+
+    #[test]
+    fn crop_is_clamped_into_the_image() {
+        // A rectangle running off the right edge must be trimmed, not allowed to panic
+        // crop_imm with out-of-range bounds.
+        let (x, y, w, h) = crop(80.0, 80.0, 50.0, 50.0).to_pixels(100, 100).unwrap();
+        assert!(x + w <= 100 && y + h <= 100, "got {},{} {}x{}", x, y, w, h);
+    }
+
+    #[test]
+    fn degenerate_crops_still_yield_a_pixel() {
+        for rect in [
+            crop(0.0, 0.0, 0.0, 0.0),
+            crop(100.0, 100.0, 10.0, 10.0),
+            crop(-50.0, -50.0, 5.0, 5.0),
+            crop(f32::NAN, 0.0, f32::NAN, 100.0),
+        ] {
+            let (x, y, w, h) = rect.to_pixels(50, 50).expect("should resolve");
+            assert!(w >= 1 && h >= 1, "{:?} gave {}x{}", rect, w, h);
+            assert!(x + w <= 50 && y + h <= 50, "{:?} escaped bounds", rect);
+        }
+    }
+
+    #[test]
+    fn full_frame_crop_is_recognised_as_a_no_op() {
+        assert!(crop(0.0, 0.0, 100.0, 100.0).is_full_frame());
+        assert!(!crop(0.0, 0.0, 99.0, 100.0).is_full_frame());
+        assert!(!crop(1.0, 0.0, 100.0, 100.0).is_full_frame());
+    }
+
+    // --- the two combined ---
+
+    #[test]
+    fn crop_is_applied_before_resize() {
+        // Crop 1000x1000 down to the middle 500x500, then fit into 250x250.
+        let rect = crop(25.0, 25.0, 50.0, 50.0);
+        let resize = fit(Some(250), Some(250));
+        assert_eq!(planned_dimensions(1000, 1000, Some(&rect), Some(&resize)), (250, 250));
+
+        // If resize ran first, a 2:1 source cropped to a square would come out non-square.
+        let rect = crop(0.0, 0.0, 50.0, 100.0); // square region of a 2:1 image
+        let resize = fit(Some(400), Some(400));
+        assert_eq!(
+            planned_dimensions(1000, 500, Some(&rect), Some(&resize)),
+            (400, 400),
+            "cropping first should give a square"
+        );
+    }
+
+    #[test]
+    fn planned_dimensions_matches_what_conversion_produces() {
+        let dir = scratch_dir();
+        let source = dir.join("source.png");
+        write_png(&source, 800, 400);
+
+        let rect = crop(10.0, 20.0, 60.0, 50.0);
+        let resize = fit(Some(200), None);
+        let expected = planned_dimensions(800, 400, Some(&rect), Some(&resize));
+
+        let mut opts = options("png", OutputMode::SameFolder);
+        opts.crop = Some(rect);
+        opts.resize = Some(resize);
+
+        let dest = dir.join("out.png");
+        let result = convert_single_image(
+            source.to_str().unwrap(),
+            dest.to_str().unwrap().to_string(),
+            &opts,
+        );
+        assert!(result.success, "conversion failed: {:?}", result.error);
+
+        let actual = image::open(&dest).unwrap();
+        assert_eq!(
+            (actual.width(), actual.height()),
+            expected,
+            "planned dimensions must match the real output"
+        );
+    }
+
+    #[test]
+    fn cropping_selects_the_right_region() {
+        // Left half red, right half blue; crop the right half and check what survives.
+        let mut img = image::RgbImage::new(100, 10);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 50 {
+                image::Rgb([255, 0, 0])
+            } else {
+                image::Rgb([0, 0, 255])
+            };
+        }
+        let img = image::DynamicImage::ImageRgb8(img);
+
+        let rect = crop(50.0, 0.0, 50.0, 100.0);
+        let out = apply_transforms(img, Some(&rect), None);
+
+        assert_eq!((out.width(), out.height()), (50, 10));
+        assert_eq!(out.to_rgb8().get_pixel(0, 0), &image::Rgb([0, 0, 255]), "should be the blue half");
+        assert_eq!(out.to_rgb8().get_pixel(49, 9), &image::Rgb([0, 0, 255]));
+    }
+
+    #[test]
+    fn transforms_are_skipped_when_they_would_change_nothing() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(64, 32));
+        let full = crop(0.0, 0.0, 100.0, 100.0);
+        let same = fit(Some(64), Some(32));
+
+        let out = apply_transforms(img.clone(), Some(&full), Some(&same));
+        assert_eq!((out.width(), out.height()), (64, 32));
+        assert_eq!(out.to_rgb8(), img.to_rgb8(), "pixels should be untouched");
+    }
+
+    #[test]
+    fn plan_output_dimensions_maps_every_source() {
+        let planned = plan_output_dimensions(
+            vec![
+                PlannedSize { width: 1000, height: 500 },
+                PlannedSize { width: 400, height: 400 },
+            ],
+            Some(crop(0.0, 0.0, 50.0, 100.0)),
+            Some(fit(Some(100), None)),
+        );
+
+        let got: Vec<(u32, u32)> = planned.iter().map(|p| (p.width, p.height)).collect();
+        // 1000x500 -> crop 500x500 -> fit width 100 -> 100x100
+        // 400x400  -> crop 200x400 -> fit width 100 -> 100x200
+        assert_eq!(got, vec![(100, 100), (100, 200)]);
+    }
+
+    // --- the test-images corpus ---
+    //
+    // A mix of real photographs (one with EXIF orientation Rotate270, two with ICC profiles,
+    // one PNG with alpha) and generated images covering characteristics the photos don't:
+    // flat colour, hard edges, pure noise, smooth gradient, a 25:1 aspect ratio, greyscale,
+    // and an image smaller than a single estimation sample tile.
+
+    fn corpus_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test-images")
+    }
+
+    /// Every readable image in `test-images/`, sorted so failures are reproducible.
+    fn corpus_paths() -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(corpus_dir()) else {
+            return Vec::new();
+        };
+
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| IMAGE_EXTENSIONS_FOR_TESTS.contains(&e.to_lowercase().as_str()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    const IMAGE_EXTENSIONS_FOR_TESTS: &[&str] =
+        &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico"];
+
+    fn name_of(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn corpus_is_present_and_readable() {
+        let paths = corpus_paths();
+        assert!(
+            !paths.is_empty(),
+            "no images found in {} — the corpus tests need it populated",
+            corpus_dir().display()
+        );
+
+        for path in &paths {
+            let info = read_image_info(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{}: {}", name_of(path), e));
+            assert!(info.width > 0 && info.height > 0, "{} has no size", info.name);
+        }
+    }
+
+    /// Runs the whole pipeline over every corpus image, into every output format, and checks
+    /// the result is a decodable image of exactly the planned dimensions.
+    #[test]
+    fn every_corpus_image_converts_to_every_format() {
+        let dir = scratch_dir();
+
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let source = path.to_str().unwrap();
+            let info = read_image_info(source).expect("info");
+
+            for format in ["png", "jpg", "webp", "gif", "bmp", "tiff"] {
+                let mut opts = options(format, OutputMode::CustomFolder);
+                opts.output_folder = Some(dir.to_str().unwrap().to_string());
+                // Downscale so the test stays quick on 12-megapixel photographs.
+                opts.resize = Some(fit(Some(320), Some(320)));
+
+                let mut reserved = HashSet::new();
+                let dest = get_output_path(source, &opts, &mut reserved).expect("plan path");
+                let result = convert_single_image(source, dest.clone(), &opts);
+                assert!(
+                    result.success,
+                    "{} -> {} failed: {:?}",
+                    name, format, result.error
+                );
+
+                let expected = planned_dimensions(
+                    info.width,
+                    info.height,
+                    opts.crop.as_ref(),
+                    opts.resize.as_ref(),
+                );
+                let decoded = image::open(&dest)
+                    .unwrap_or_else(|e| panic!("{} -> {} unreadable: {}", name, format, e));
+                assert_eq!(
+                    (decoded.width(), decoded.height()),
+                    expected,
+                    "{} -> {} dimensions",
+                    name,
+                    format
+                );
+            }
+        }
+    }
+
+    /// Cropping and resizing every corpus image, checking the output matches the plan. Real
+    /// images matter here because their odd dimensions expose rounding the synthetic ones don't.
+    #[test]
+    fn crop_and_resize_match_the_plan_across_the_corpus() {
+        let dir = scratch_dir();
+
+        let cases = [
+            (crop(0.0, 0.0, 100.0, 100.0), fit(Some(200), None)),
+            (crop(10.0, 20.0, 55.0, 45.0), fit(Some(200), Some(200))),
+            (crop(33.3, 33.3, 33.4, 33.4), stretch(Some(150), Some(90))),
+            (crop(0.0, 0.0, 7.0, 100.0), fit(Some(64), Some(64))),
+        ];
+
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let source = path.to_str().unwrap();
+            let info = read_image_info(source).expect("info");
+
+            for (i, (rect, resize)) in cases.iter().enumerate() {
+                let mut opts = options("png", OutputMode::CustomFolder);
+                opts.output_folder = Some(dir.to_str().unwrap().to_string());
+                opts.crop = Some(*rect);
+                opts.resize = Some(*resize);
+
+                let dest = dir.join(format!("{}-case{}.png", info.width, i));
+                let result = convert_single_image(
+                    source,
+                    dest.to_str().unwrap().to_string(),
+                    &opts,
+                );
+                assert!(result.success, "{} case {} failed: {:?}", name, i, result.error);
+
+                let expected =
+                    planned_dimensions(info.width, info.height, Some(rect), Some(resize));
+                let decoded = image::open(&dest).expect("decode");
+                assert_eq!(
+                    (decoded.width(), decoded.height()),
+                    expected,
+                    "{} case {}: plan disagreed with output",
+                    name,
+                    i
+                );
+                assert!(
+                    decoded.width() >= 1 && decoded.height() >= 1,
+                    "{} case {} collapsed to nothing",
+                    name,
+                    i
+                );
+            }
+        }
+    }
+
+    /// Metadata preservation over real files, which is the only place genuine multi-kilobyte
+    /// EXIF blocks and real ICC profiles get exercised.
+    #[test]
+    fn corpus_metadata_survives_where_the_format_allows() {
+        let dir = scratch_dir();
+
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let source = path.to_str().unwrap();
+
+            let (_, planted) = decode_oriented(source).expect("decode");
+            if planted.is_empty() {
+                continue; // nothing to preserve for this input
+            }
+
+            for format in ["jpg", "png", "webp"] {
+                let mut opts = options(format, OutputMode::CustomFolder);
+                opts.output_folder = Some(dir.to_str().unwrap().to_string());
+                opts.resize = Some(fit(Some(200), Some(200)));
+
+                let dest = dir.join(format!("meta-{}.{}", name.replace('.', "_"), format));
+                let result =
+                    convert_single_image(source, dest.to_str().unwrap().to_string(), &opts);
+                assert!(result.success, "{} -> {}: {:?}", name, format, result.error);
+
+                let mut decoder = ImageReader::open(&dest)
+                    .unwrap()
+                    .with_guessed_format()
+                    .unwrap()
+                    .into_decoder()
+                    .unwrap();
+
+                if planted.exif.is_some() {
+                    assert!(
+                        decoder.exif_metadata().ok().flatten().is_some(),
+                        "{} -> {}: exif was dropped",
+                        name,
+                        format
+                    );
+                }
+                if planted.icc.is_some() {
+                    assert!(
+                        decoder.icc_profile().ok().flatten().is_some(),
+                        "{} -> {}: icc profile was dropped",
+                        name,
+                        format
+                    );
+                }
+            }
+        }
+    }
+
+    /// Any preserved Exif must report "no transforms", because the rotation is already baked
+    /// into the pixels. `002585160005.jpg` carries Rotate270, so this has a real case to catch.
+    #[test]
+    fn corpus_outputs_never_carry_a_stale_orientation_tag() {
+        let dir = scratch_dir();
+        let mut checked_a_rotated_source = false;
+
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let source = path.to_str().unwrap();
+
+            let mut decoder = ImageReader::open(source)
+                .unwrap()
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            let source_orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            if source_orientation != Orientation::NoTransforms {
+                checked_a_rotated_source = true;
+            }
+
+            let mut opts = options("jpg", OutputMode::CustomFolder);
+            opts.output_folder = Some(dir.to_str().unwrap().to_string());
+            opts.resize = Some(fit(Some(200), Some(200)));
+
+            let dest = dir.join(format!("orient-{}.jpg", name.replace('.', "_")));
+            let result = convert_single_image(source, dest.to_str().unwrap().to_string(), &opts);
+            assert!(result.success, "{}: {:?}", name, result.error);
+
+            if let Some(exif) = read_back_exif(&dest) {
+                if let Some(found) = Orientation::from_exif_chunk(&exif) {
+                    assert_eq!(
+                        found,
+                        Orientation::NoTransforms,
+                        "{} kept orientation {:?}; viewers would rotate it again",
+                        name,
+                        found
+                    );
+                }
+            }
+        }
+
+        assert!(
+            checked_a_rotated_source,
+            "corpus no longer contains an image with a non-trivial orientation tag, \
+             so this test proves nothing — add one back"
+        );
+    }
+
+    /// Rotated sources must come out with orientation applied, i.e. transposed dimensions.
+    #[test]
+    fn corpus_rotation_is_applied_to_pixels() {
+        for path in corpus_paths() {
+            let source = path.to_str().unwrap();
+            let mut decoder = ImageReader::open(source)
+                .unwrap()
+                .with_guessed_format()
+                .unwrap()
+                .into_decoder()
+                .unwrap();
+            let (raw_w, raw_h) = decoder.dimensions();
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+
+            let (img, _) = decode_oriented(source).expect("decode");
+
+            let expected = if orientation_swaps_axes(orientation) {
+                (raw_h, raw_w)
+            } else {
+                (raw_w, raw_h)
+            };
+            assert_eq!(
+                (img.width(), img.height()),
+                expected,
+                "{}: orientation {:?} not applied",
+                name_of(&path),
+                orientation
+            );
+
+            // read_image_info must agree, since the UI shows its numbers.
+            let info = read_image_info(source).expect("info");
+            assert_eq!((info.width, info.height), expected, "{} info mismatch", info.name);
+        }
+    }
+
+    // --- size estimation ---
+
+    /// Percentage error of the estimate against a real full encode.
+    fn estimate_error_pct(
+        img: &image::DynamicImage,
+        opts: &ConversionOptions,
+    ) -> f64 {
+        let sample = build_sample(img);
+        let estimated = estimate_one(&sample, opts).expect("estimate") as f64;
+
+        let transformed = apply_transforms(img.clone(), opts.crop.as_ref(), opts.resize.as_ref());
+        let actual = encode_to_bytes(&transformed, opts).expect("encode").len() as f64;
+
+        (estimated / actual - 1.0) * 100.0
+    }
+
+    #[test]
+    fn estimates_are_not_wildly_wrong_on_synthetic_content() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(1400, 900));
+
+        for format in ["jpg", "webp", "png"] {
+            for quality in [40u8, 85] {
+                let mut opts = options(format, OutputMode::SameFolder);
+                opts.quality = quality;
+
+                let err = estimate_error_pct(&img, &opts);
+                assert!(
+                    err.abs() < 30.0,
+                    "{} q{} estimate off by {:+.1}%",
+                    format,
+                    quality,
+                    err
+                );
+            }
+        }
+    }
+
+    /// Diagnostic, not an assertion: prints the estimator's error surface over the whole
+    /// corpus. Run with `--ignored --nocapture` when tuning the sampling strategy.
+    #[test]
+    #[ignore = "diagnostic; run explicitly with --ignored --nocapture"]
+    fn report_estimate_accuracy_over_corpus() {
+        println!(
+            "\n{:<24} {:<6} {:>6} {:>8}",
+            "image", "fmt", "target", "err%"
+        );
+
+        let mut worst: (String, f64) = (String::new(), 0.0);
+
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let (img, _) = decode_oriented(path.to_str().unwrap()).expect("decode");
+
+            for format in ["jpg", "webp", "png"] {
+                for target in [None, Some(1200u32), Some(600), Some(200)] {
+                    let mut opts = options(format, OutputMode::SameFolder);
+                    opts.resize = target.map(|t| fit(Some(t), None));
+
+                    let err = estimate_error_pct(&img, &opts);
+                    let label = target.map_or("native".to_string(), |t| t.to_string());
+                    println!("{:<24} {:<6} {:>6} {:>+8.1}", name, format, label, err);
+
+                    if err.abs() > worst.1.abs() {
+                        worst = (format!("{} {} {}", name, format, label), err);
+                    }
+                }
+            }
+        }
+
+        println!("\nworst: {} at {:+.1}%", worst.0, worst.1);
+    }
+
+    /// Sanity bound on the estimator across the whole corpus.
+    ///
+    /// This is deliberately loose. The estimate is a guide, not a measurement, and chasing
+    /// every synthetic corner case is not worth it — a 600x600 image with a hard-edged
+    /// transparent circle overestimates by ~90% because the quadrant sample tiles land on the
+    /// opaque middle and miss the empty corners. What the test is really for is catching a
+    /// return to the original implementation, which extrapolated from a downscaled proxy and
+    /// *underestimated* by 50-84% on detailed images. Hence the tight floor and loose ceiling.
+    #[test]
+    fn corpus_estimates_stay_in_the_right_ballpark() {
+        for path in corpus_paths() {
+            let name = name_of(&path);
+            let (img, _) = decode_oriented(path.to_str().unwrap()).expect("decode");
+
+            for format in ["jpg", "webp", "png"] {
+                for target in [None, Some(800u32), Some(300)] {
+                    let mut opts = options(format, OutputMode::SameFolder);
+                    opts.resize = target.map(|t| fit(Some(t), None));
+
+                    let ratio = estimate_error_pct(&img, &opts) / 100.0 + 1.0;
+                    assert!(
+                        (0.7..2.1).contains(&ratio),
+                        "{} {} target {:?}: estimate was {:.2}x the real size",
+                        name,
+                        format,
+                        target,
+                        ratio
+                    );
+                }
+            }
+        }
+    }
+
+    /// Downscaled outputs go through the whole-proxy path, which involves no extrapolation and
+    /// should therefore land very close.
+    #[test]
+    fn downscaled_estimates_are_near_exact() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(1600, 1200));
+
+        for format in ["jpg", "webp", "png"] {
+            for target in [600u32, 300, 150] {
+                let mut opts = options(format, OutputMode::SameFolder);
+                opts.resize = Some(fit(Some(target), None));
+
+                let err = estimate_error_pct(&img, &opts);
+                assert!(
+                    err.abs() < 10.0,
+                    "{} resize to {}px estimate off by {:+.1}%",
+                    format,
+                    target,
+                    err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn size_estimates_account_for_cropping() {
+        // Kept under SAMPLE_PROXY_EDGE so both estimates take the same code path; comparing a
+        // tile-extrapolated figure against a whole-proxy one would not be meaningful.
+        let img = image::DynamicImage::ImageRgb8(noisy_image(600, 600));
+
+        let mut opts = options("jpg", OutputMode::SameFolder);
+        let full = estimate_one(&build_sample(&img), &opts).unwrap();
+
+        // Cropping to a quarter of the area should roughly quarter the estimate.
+        opts.crop = Some(crop(25.0, 25.0, 50.0, 50.0));
+        let quarter = estimate_one(&build_sample(&img), &opts).unwrap();
+
+        let ratio = quarter as f64 / full as f64;
+        assert!(
+            (0.15..0.35).contains(&ratio),
+            "quarter-area crop gave ratio {:.2}, expected near 0.25",
+            ratio
+        );
+    }
+
+    #[test]
+    fn small_images_are_sampled_whole_and_estimated_exactly() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(200, 150));
+        let sample = build_sample(&img);
+        assert!(sample.whole_image, "a small image should be sampled entirely");
+
+        let opts = options("jpg", OutputMode::SameFolder);
+        let err = estimate_error_pct(&img, &opts);
+        assert!(err.abs() < 1.0, "whole-image sample should be near exact, got {:+.3}%", err);
+    }
+
+    #[test]
+    fn sample_tiles_cover_the_grid_at_native_resolution() {
+        let img = image::DynamicImage::ImageRgb8(noisy_image(2000, 1000));
+        let sample = build_sample(&img);
+
+        assert!(!sample.whole_image);
+        assert_eq!(sample.tiles.len(), (SAMPLE_GRID * SAMPLE_GRID) as usize);
+        assert_eq!(sample.source_width, 2000);
+        assert_eq!(sample.source_height, 1000);
+        for tile in &sample.tiles {
+            assert_eq!(
+                (tile.width(), tile.height()),
+                (SAMPLE_TILE_EDGE, SAMPLE_TILE_EDGE),
+                "tiles must be native-resolution crops, not downscales"
+            );
         }
     }
 

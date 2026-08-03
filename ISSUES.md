@@ -14,14 +14,23 @@ renumber when items close.
 | 7 | EXIF and ICC profiles are silently dropped | Medium | **Fixed** (JPEG/PNG/WebP) |
 | 8 | Filenames are interpolated into `innerHTML` | Low | **Fixed** |
 | 9 | Assorted smaller items | Low | Partly fixed |
+| 10 | Greyscale sources failed to convert to GIF | Medium | **Fixed** |
+| 11 | `thumbnail()` enlarged small images | Low | **Fixed** |
 
 ## Verification status
 
 Read this before trusting any "Fixed" above.
 
-`cargo test` in `src-tauri/` runs 30 tests covering the Rust conversion logic: output-path
-planning for all three output modes, batch collision handling, the atomic-write behaviour,
-the WebP encoder, and Exif/ICC preservation. They call the conversion functions directly.
+`cargo test --release` in `src-tauri/` runs 58 tests covering the Rust conversion logic:
+output-path planning for all three output modes, batch collision handling, the atomic-write
+behaviour, the WebP encoder, Exif/ICC preservation, the crop and resize maths, and
+size-estimation accuracy. They call the conversion functions directly.
+
+Several of them run over every image in `src-tauri/test-images/`, a corpus of real photographs
+plus generated images covering orientation, ICC, alpha, greyscale, flat colour, hard edges,
+noise, extreme aspect ratios and sub-tile sizes. Adding files to that folder widens coverage
+without touching test code, and it has already caught two bugs that synthetic tests missed
+(items 10 and 11).
 
 **Nothing about the running app is covered by an automated test.** There is no frontend test
 tooling in the project at all, and Tauri's WebDriver support does not extend to macOS, so
@@ -258,6 +267,70 @@ Two things worth knowing about the CSP:
 
 ---
 
+## 10. Greyscale sources failed to convert to GIF — Fixed
+
+Found by the test corpus, not by inspection. Converting a greyscale PNG to GIF died with
+"the encoder or decoder for Gif does not support the color type `L8`".
+
+The `image` crate's encoders each accept a different subset of colour types and return an error
+rather than converting. Any greyscale input therefore failed for GIF, and 16-bit inputs were
+exposed to the same class of failure for several formats.
+
+`normalise_for_format` now converts to a type the target encoder accepts before encoding,
+keeping alpha where the format supports it and dropping it for JPEG. `every_corpus_image_converts_to_every_format`
+covers the whole matrix of corpus images against every output format, so this class of bug
+cannot come back quietly.
+
+## Resize, crop and size estimation — added
+
+Not a defect; recorded because the design has constraints worth knowing.
+
+**Resize** is width/height with an aspect lock (on by default, fitting each image inside the
+given box) and a never-enlarge option (also on). With the lock off, each axis is independent and
+images stretch — "free resizing". A blank axis keeps the source's size. There is no percentage
+mode; two fields covered the ask and adding a third input for it can wait.
+
+**Crop is one rectangle for the whole batch**, stored as percentages so it lands in the same
+relative place on any image size. It is set by dragging over a preview of whichever file is
+selected. It is deliberately *not* per-image: per-image crops would need per-file state and a
+crop editor per row, which is a much larger feature. The consequence is that a batch of mixed
+aspect ratios gets the same *relative* region, not the same subject.
+
+Crop runs before resize, so the resize box describes the visible region. `plan_output_dimensions`
+is the single source of truth for the resulting size — the UI calls it rather than reimplementing
+the rules in TypeScript, and `planned_dimensions_matches_what_conversion_produces` ties it to
+what actually gets written.
+
+**Size estimation** encodes a sample and extrapolates. Two regimes: outputs at or below 640px
+on the long edge encode a cached whole-image proxy at the exact target size (near-exact, no
+extrapolation); larger outputs use four native-resolution tiles, scaled by the factor the real
+image gets, stitched into one image, with measured container overhead subtracted before
+multiplying up.
+
+The obvious approach — extrapolating from a downscaled proxy — was tried first and
+**underestimated by 50-84%**, because shrinking an image averages away the high-frequency detail
+that costs the bytes. Sampling at native resolution is the whole point, and
+`corpus_estimates_stay_in_the_right_ballpark` has a tight floor and loose ceiling specifically to
+catch a regression back to that.
+
+Accuracy over the corpus: real photographs within ~25%, a smooth gradient ~+30%, and an image
+that is mostly hard-edged transparency ~+90% because the quadrant tiles land on the opaque
+middle and miss the empty corners. It is labelled an estimate in the UI and is not worth
+perfecting further. Decoded samples are cached per file and pruned to the current selection, so
+memory is bounded by the batch, not the session.
+
+## 11. `thumbnail()` enlarged small images — Fixed
+
+`DynamicImage::thumbnail` scales to *fit* its box, which means it enlarges anything smaller
+than the box rather than leaving it alone.
+
+Two places got this wrong. The size-estimation proxy was being upscaled and then scaled back
+down to the output size, and the double resample softened the image enough to underestimate by
+30%. `get_thumbnail` had the same issue, producing a blurry upscaled preview and a needlessly
+large data URI for small images. Both now only shrink.
+
+---
+
 ## Needs manual verification
 
 Automated tests cover the Rust conversion logic only. These need a human with the app open,
@@ -291,6 +364,23 @@ and none of them have been confirmed since the changes above:
    should appear as literal text in the list.
 10. **Errors are visible** — add a `.png` that isn't really a PNG and confirm the status line
     names it instead of silently skipping it.
+11. **The crop box drags properly** — none of the pointer handling has been exercised in a real
+    window. Check that dragging inside moves the selection, that all eight handles resize from
+    the right edge, that the box can't leave the image or collapse below its minimum, and that
+    the numeric percentage fields and the box stay in sync in both directions.
+12. **The crop preview follows the file you pick** — click different files in the list and
+    confirm the preview and its highlight follow, and that the crop rectangle stays put.
+13. **A rotated image in the crop preview** — `002585160005.jpg` in `test-images/` has EXIF
+    orientation `Rotate270`. Its preview must appear upright, otherwise the crop rectangle would
+    be framed against a different orientation than the output.
+14. **Resize behaves as described** — with *Keep aspect ratio* on, one dimension should be
+    enough and the file list should show sensible targets. With it off, both fields should
+    stretch to exactly those numbers. *Never enlarge* should stop a small image growing.
+15. **The size estimate tracks the settings** — it should update as you drag the quality slider
+    or change resize/crop, without visibly lagging on a large batch, and read as an estimate
+    rather than a promise.
+16. **Layout on a narrow window** — the crop editor, resize fields and estimate line are all new
+    and unchecked in a real window, in both light and dark mode.
 
 Note that a production build (`npm run tauri build`) is required to test anything CSP-related;
 `tauri dev` does not apply the CSP at all.
@@ -304,18 +394,21 @@ Not bugs — recorded so they don't get lost.
 macOS has shipped a built-in **Finder → Quick Actions → Convert Image** since Ventura,
 with format choice, a size option and a "preserve metadata" checkbox. That is the bar.
 
-The app now clears part of it: lossy WebP (which Finder won't produce) and metadata
-preservation with a strip toggle. It is still behind on resize and HEIC input.
+The app now clears most of it: lossy WebP (which Finder won't produce), metadata preservation
+with a strip toggle, resizing, batch cropping, and an output-size estimate before committing —
+none of which Finder offers. It is still behind on HEIC input.
 
 The gaps that would give it a clear reason to exist, roughly in order of value:
 
-1. **Resize** — long-edge max, percentage, fit-in-box. Now the biggest missing feature for
-   web use, arguably more than format choice.
-2. **Working AVIF input** (item 4) — output already works; decoding needs dav1d.
-3. **Saved presets** — e.g. "blog hero: 1600px wide, WebP q80, strip EXIF" as one click.
-   Finder makes you re-pick settings every time.
-4. **Watched folders** — drop a file into `~/to-optimize`, get a converted copy out.
+1. **Saved presets** — e.g. "blog hero: 1600px wide, WebP q80, strip EXIF" as one click. Now
+   that there are this many knobs, re-picking them every time is the main friction, and Finder
+   makes you do the same.
+2. **HEIC input** — what every iPhone photo is.
+3. **Watched folders** — drop a file into `~/to-optimize`, get a converted copy out.
    Nothing built-in does this, and it turns a utility into background infrastructure.
+4. **Working AVIF input** (item 4) — output already works; decoding needs dav1d.
+5. **Percentage resize** — deliberately left out to keep the resize controls to two fields;
+   worth adding if "make everything 50%" comes up.
 
 Separately: "Pasture Panda" is a charming name and completely unsearchable for "image
 converter". Fine for a personal tool, worth reconsidering if it ever ships.

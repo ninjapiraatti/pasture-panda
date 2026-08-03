@@ -32,13 +32,47 @@ interface OutputFormatInfo {
   supports_metadata: boolean;
 }
 
+interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface ResizeOptions {
+  width: number | null;
+  height: number | null;
+  preserve_aspect: boolean;
+  no_upscale: boolean;
+}
+
+interface PlannedSize {
+  width: number;
+  height: number;
+}
+
+interface SizeEstimate {
+  estimated_bytes: number;
+  source_bytes: number;
+  counted: number;
+  failed: number;
+  approximate: boolean;
+}
+
 interface ConversionOptions {
   format: string;
   quality: number;
   output_mode: "same_folder" | "custom_folder" | "replace_original";
   output_folder: string | null;
+  crop: CropRect | null;
+  resize: ResizeOptions | null;
   preserve_metadata: boolean;
 }
+
+const FULL_FRAME: CropRect = { x: 0, y: 0, width: 100, height: 100 };
+
+/// Smallest crop the UI allows, as a percentage of the image.
+const MIN_CROP_PERCENT = 2;
 
 interface ConversionResult {
   success: boolean;
@@ -58,6 +92,13 @@ let selectedImages: ImageInfo[] = [];
 let outputFormats: OutputFormatInfo[] = [];
 let outputFolder: string | null = null;
 
+/// One crop region shared by the whole batch, in percentages so it applies to any size.
+let cropRect: CropRect = { ...FULL_FRAME };
+/// Which image the crop preview shows. The crop applies to all of them regardless.
+let previewPath: string | null = null;
+/// Target dimensions per selected image, keyed by path, from plan_output_dimensions.
+let plannedSizes = new Map<string, PlannedSize>();
+
 let dropZone: HTMLElement;
 let fileList: HTMLElement;
 let fileListContainer: HTMLElement;
@@ -68,6 +109,22 @@ let qualitySlider: HTMLInputElement;
 let qualityValue: HTMLElement;
 let preserveMetadataCheckbox: HTMLInputElement;
 let metadataHint: HTMLElement;
+let resizeWidthInput: HTMLInputElement;
+let resizeHeightInput: HTMLInputElement;
+let lockAspectCheckbox: HTMLInputElement;
+let noUpscaleCheckbox: HTMLInputElement;
+let enableCropCheckbox: HTMLInputElement;
+let cropEditor: HTMLElement;
+let cropStage: HTMLElement;
+let cropPreview: HTMLImageElement;
+let cropBox: HTMLElement;
+let cropCaption: HTMLElement;
+let cropXInput: HTMLInputElement;
+let cropYInput: HTMLInputElement;
+let cropWInput: HTMLInputElement;
+let cropHInput: HTMLInputElement;
+let cropResetBtn: HTMLElement;
+let estimateEl: HTMLElement;
 let outputModeSelect: HTMLSelectElement;
 let folderSelectBtn: HTMLElement;
 let selectedFolderEl: HTMLElement;
@@ -88,6 +145,22 @@ document.addEventListener("DOMContentLoaded", () => {
   qualityValue = document.getElementById("quality-value")!;
   preserveMetadataCheckbox = document.getElementById("preserve-metadata") as HTMLInputElement;
   metadataHint = document.getElementById("metadata-hint")!;
+  resizeWidthInput = document.getElementById("resize-width") as HTMLInputElement;
+  resizeHeightInput = document.getElementById("resize-height") as HTMLInputElement;
+  lockAspectCheckbox = document.getElementById("lock-aspect") as HTMLInputElement;
+  noUpscaleCheckbox = document.getElementById("no-upscale") as HTMLInputElement;
+  enableCropCheckbox = document.getElementById("enable-crop") as HTMLInputElement;
+  cropEditor = document.getElementById("crop-editor")!;
+  cropStage = document.getElementById("crop-stage")!;
+  cropPreview = document.getElementById("crop-preview") as HTMLImageElement;
+  cropBox = document.getElementById("crop-box")!;
+  cropCaption = document.getElementById("crop-caption")!;
+  cropXInput = document.getElementById("crop-x") as HTMLInputElement;
+  cropYInput = document.getElementById("crop-y") as HTMLInputElement;
+  cropWInput = document.getElementById("crop-w") as HTMLInputElement;
+  cropHInput = document.getElementById("crop-h") as HTMLInputElement;
+  cropResetBtn = document.getElementById("crop-reset")!;
+  estimateEl = document.getElementById("estimate")!;
   outputModeSelect = document.getElementById("output-mode") as HTMLSelectElement;
   folderSelectBtn = document.getElementById("folder-select-btn")!;
   selectedFolderEl = document.getElementById("selected-folder")!;
@@ -105,6 +178,7 @@ async function init() {
     outputFormats = await invoke<OutputFormatInfo[]>("get_supported_output_formats");
     populateFormatSelect();
     setupEventListeners();
+    setCropRect({ ...FULL_FRAME });
     await setupDragDrop();
     updateUI();
   } catch (error) {
@@ -128,10 +202,34 @@ function setupEventListeners() {
   formatSelect.addEventListener("change", () => {
     updateQualityVisibility();
     updateMetadataAvailability();
+    scheduleEstimate();
   });
   qualitySlider.addEventListener("input", () => {
     qualityValue.textContent = `${qualitySlider.value}%`;
+    scheduleEstimate();
   });
+
+  for (const input of [resizeWidthInput, resizeHeightInput]) {
+    input.addEventListener("input", () => void refreshPlan());
+  }
+  for (const box of [lockAspectCheckbox, noUpscaleCheckbox]) {
+    box.addEventListener("change", () => void refreshPlan());
+  }
+
+  enableCropCheckbox.addEventListener("change", () => {
+    updateCropVisibility();
+    void refreshPlan();
+  });
+  for (const input of [cropXInput, cropYInput, cropWInput, cropHInput]) {
+    input.addEventListener("input", cropRectFromInputs);
+  }
+  cropResetBtn.addEventListener("click", () => {
+    setCropRect({ ...FULL_FRAME });
+    void refreshPlan();
+  });
+  setupCropInteraction();
+
+  preserveMetadataCheckbox.addEventListener("change", scheduleEstimate);
 
   outputModeSelect.addEventListener("change", updateFolderVisibility);
   folderSelectBtn.addEventListener("click", selectOutputFolder);
@@ -232,6 +330,8 @@ async function loadImages(paths: string[]) {
     } else {
       showStatus(parts.join(" · "), failed.length > 0 ? "error" : "success");
     }
+
+    await refreshPlan();
   } catch (error) {
     console.error("Failed to load images:", error);
     showStatus(`Failed to load images: ${error}`, "error");
@@ -249,6 +349,7 @@ function updateUI() {
   renderFileList();
   updateQualityVisibility();
   updateMetadataAvailability();
+  updateCropVisibility();
   updateFolderVisibility();
 }
 
@@ -264,9 +365,17 @@ function renderFileList() {
     name.textContent = img.name;
     name.title = img.path;
 
+    // Show the target size only when crop or resize actually change it.
+    const planned = plannedSizes.get(img.path);
+    const resized =
+      planned && (planned.width !== img.width || planned.height !== img.height);
+    const dimensions = resized
+      ? `${img.width}x${img.height} → ${planned!.width}x${planned!.height}`
+      : `${img.width}x${img.height}`;
+
     const meta = document.createElement("span");
     meta.className = "file-meta";
-    meta.textContent = `${img.width}x${img.height} · ${img.format} · ${formatBytes(img.size_bytes)}`;
+    meta.textContent = `${dimensions} · ${img.format} · ${formatBytes(img.size_bytes)}`;
 
     const info = document.createElement("div");
     info.className = "file-info";
@@ -276,14 +385,28 @@ function renderFileList() {
     remove.className = "remove-btn";
     remove.title = "Remove";
     remove.textContent = "×";
-    remove.addEventListener("click", () => {
+    remove.addEventListener("click", (event) => {
+      event.stopPropagation(); // don't also select it as the crop preview
       selectedImages.splice(index, 1);
+      if (previewPath === img.path) previewPath = null;
       updateUI();
+      void refreshPlan();
     });
 
     const item = document.createElement("div");
     item.className = "file-item";
+    if (enableCropCheckbox?.checked && img.path === previewPath) {
+      item.classList.add("selected");
+    }
     item.append(info, remove);
+
+    // Clicking a file frames the crop against it. Harmless when cropping is off.
+    item.addEventListener("click", () => {
+      if (previewPath === img.path) return;
+      previewPath = img.path;
+      renderFileList();
+      if (enableCropCheckbox.checked) void loadCropPreview();
+    });
 
     fileList.append(item);
   });
@@ -293,6 +416,266 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// --- resize and crop state ---
+
+function parseDimension(input: HTMLInputElement): number | null {
+  const value = parseInt(input.value, 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/// The resize settings, or null when nothing has been asked for.
+function currentResize(): ResizeOptions | null {
+  const width = parseDimension(resizeWidthInput);
+  const height = parseDimension(resizeHeightInput);
+  if (width === null && height === null) return null;
+
+  return {
+    width,
+    height,
+    preserve_aspect: lockAspectCheckbox.checked,
+    no_upscale: noUpscaleCheckbox.checked,
+  };
+}
+
+function currentCrop(): CropRect | null {
+  return enableCropCheckbox.checked ? cropRect : null;
+}
+
+/// Everything the backend needs, shared by conversion and estimation so the two can't drift.
+function currentOptions(): ConversionOptions {
+  return {
+    format: formatSelect.value,
+    quality: parseInt(qualitySlider.value),
+    output_mode: outputModeSelect.value as ConversionOptions["output_mode"],
+    output_folder: outputFolder,
+    crop: currentCrop(),
+    resize: currentResize(),
+    // A disabled checkbox keeps its checked state, so gate on the format too.
+    preserve_metadata: preserveMetadataCheckbox.checked && !preserveMetadataCheckbox.disabled,
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function setCropRect(rect: CropRect, syncInputs = true) {
+  // Keep the rectangle inside the frame and above the minimum size.
+  const width = clamp(rect.width, MIN_CROP_PERCENT, 100);
+  const height = clamp(rect.height, MIN_CROP_PERCENT, 100);
+  cropRect = {
+    width,
+    height,
+    x: clamp(rect.x, 0, 100 - width),
+    y: clamp(rect.y, 0, 100 - height),
+  };
+
+  cropBox.style.left = `${cropRect.x}%`;
+  cropBox.style.top = `${cropRect.y}%`;
+  cropBox.style.width = `${cropRect.width}%`;
+  cropBox.style.height = `${cropRect.height}%`;
+
+  if (syncInputs) {
+    const round = (n: number) => Math.round(n * 10) / 10;
+    cropXInput.value = String(round(cropRect.x));
+    cropYInput.value = String(round(cropRect.y));
+    cropWInput.value = String(round(cropRect.width));
+    cropHInput.value = String(round(cropRect.height));
+  }
+}
+
+function cropRectFromInputs() {
+  const num = (input: HTMLInputElement, fallback: number) => {
+    const value = parseFloat(input.value);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  setCropRect(
+    {
+      x: num(cropXInput, cropRect.x),
+      y: num(cropYInput, cropRect.y),
+      width: num(cropWInput, cropRect.width),
+      height: num(cropHInput, cropRect.height),
+    },
+    false
+  );
+  refreshPlan();
+}
+
+/// Drag to move the selection, or drag a handle to resize it. Everything is computed in
+/// percentages against the rendered preview, which is why the stage is sized to the image.
+function setupCropInteraction() {
+  let handle: string | null = null;
+  let origin = { x: 0, y: 0 };
+  let startRect = { ...FULL_FRAME };
+
+  cropStage.addEventListener("pointerdown", (event) => {
+    const target = event.target as HTMLElement;
+    const grabbed = target.dataset.handle;
+    if (!grabbed && target !== cropBox) return;
+
+    handle = grabbed ?? "move";
+    origin = { x: event.clientX, y: event.clientY };
+    startRect = { ...cropRect };
+    cropStage.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+
+  cropStage.addEventListener("pointermove", (event) => {
+    if (!handle) return;
+
+    const bounds = cropPreview.getBoundingClientRect();
+    if (bounds.width === 0 || bounds.height === 0) return;
+    const dx = ((event.clientX - origin.x) / bounds.width) * 100;
+    const dy = ((event.clientY - origin.y) / bounds.height) * 100;
+
+    if (handle === "move") {
+      setCropRect({ ...startRect, x: startRect.x + dx, y: startRect.y + dy });
+    } else {
+      const next = { ...startRect };
+      // Handle names combine edges, so "nw" drags both the north and west edges.
+      if (handle.includes("w")) {
+        const right = startRect.x + startRect.width;
+        next.x = clamp(startRect.x + dx, 0, right - MIN_CROP_PERCENT);
+        next.width = right - next.x;
+      }
+      if (handle.includes("e")) {
+        next.width = clamp(startRect.width + dx, MIN_CROP_PERCENT, 100 - startRect.x);
+      }
+      if (handle.includes("n")) {
+        const bottom = startRect.y + startRect.height;
+        next.y = clamp(startRect.y + dy, 0, bottom - MIN_CROP_PERCENT);
+        next.height = bottom - next.y;
+      }
+      if (handle.includes("s")) {
+        next.height = clamp(startRect.height + dy, MIN_CROP_PERCENT, 100 - startRect.y);
+      }
+      setCropRect(next);
+    }
+  });
+
+  const finish = (event: PointerEvent) => {
+    if (!handle) return;
+    handle = null;
+    if (cropStage.hasPointerCapture(event.pointerId)) {
+      cropStage.releasePointerCapture(event.pointerId);
+    }
+    refreshPlan();
+  };
+
+  cropStage.addEventListener("pointerup", finish);
+  cropStage.addEventListener("pointercancel", finish);
+}
+
+async function loadCropPreview() {
+  if (!enableCropCheckbox.checked || selectedImages.length === 0) return;
+
+  // Default to the first image; the crop applies to all of them either way.
+  if (!previewPath || !selectedImages.some((img) => img.path === previewPath)) {
+    previewPath = selectedImages[0].path;
+  }
+
+  const target = selectedImages.find((img) => img.path === previewPath)!;
+  try {
+    cropPreview.src = await invoke<string>("get_thumbnail", { path: target.path });
+    cropCaption.textContent =
+      selectedImages.length > 1
+        ? `Previewing ${target.name} — click another file to frame against it`
+        : target.name;
+  } catch (error) {
+    console.error("Failed to load preview:", error);
+    cropCaption.textContent = `Could not preview ${target.name}`;
+  }
+}
+
+function updateCropVisibility() {
+  const enabled = enableCropCheckbox.checked && selectedImages.length > 0;
+  cropEditor.style.display = enabled ? "block" : "none";
+  if (enabled) void loadCropPreview();
+}
+
+// --- planned dimensions and size estimate ---
+
+/// Recomputes target dimensions and re-runs the estimate. Dimensions come from the backend so
+/// there is a single implementation of the crop/resize rules rather than a drifting copy here.
+async function refreshPlan() {
+  await refreshPlannedSizes();
+  scheduleEstimate();
+}
+
+async function refreshPlannedSizes() {
+  if (selectedImages.length === 0) {
+    plannedSizes.clear();
+    return;
+  }
+
+  try {
+    const planned = await invoke<PlannedSize[]>("plan_output_dimensions", {
+      sources: selectedImages.map((img) => ({ width: img.width, height: img.height })),
+      crop: currentCrop(),
+      resize: currentResize(),
+    });
+
+    plannedSizes = new Map(
+      selectedImages.map((img, index) => [img.path, planned[index]])
+    );
+    renderFileList();
+  } catch (error) {
+    console.error("Failed to plan dimensions:", error);
+  }
+}
+
+let estimateTimer: number | undefined;
+/// Guards against an older, slower estimate overwriting a newer one.
+let estimateToken = 0;
+
+function scheduleEstimate() {
+  window.clearTimeout(estimateTimer);
+  if (selectedImages.length === 0) {
+    estimateEl.textContent = "";
+    return;
+  }
+
+  estimateEl.textContent = "Estimating output size…";
+  estimateTimer = window.setTimeout(() => void runEstimate(), 300);
+}
+
+async function runEstimate() {
+  const token = ++estimateToken;
+  const paths = selectedImages.map((img) => img.path);
+
+  try {
+    const estimate = await invoke<SizeEstimate>("estimate_output_size", {
+      paths,
+      options: currentOptions(),
+    });
+    if (token !== estimateToken) return; // superseded
+
+    renderEstimate(estimate);
+  } catch (error) {
+    if (token !== estimateToken) return;
+    console.error("Failed to estimate size:", error);
+    estimateEl.textContent = "";
+  }
+}
+
+function renderEstimate(estimate: SizeEstimate) {
+  estimateEl.textContent = "";
+  if (estimate.counted === 0) return;
+
+  const prefix = estimate.approximate ? "≈ " : "";
+  const value = document.createElement("span");
+  value.className = "estimate-value";
+  value.textContent = `${prefix}${formatBytes(estimate.estimated_bytes)}`;
+
+  const detail = document.createTextNode(
+    ` from ${formatBytes(estimate.source_bytes)}` +
+      (estimate.approximate ? " · estimated, not exact" : "") +
+      (estimate.failed > 0 ? ` · ${estimate.failed} could not be read` : "")
+  );
+
+  estimateEl.append(document.createTextNode("Output "), value, detail);
 }
 
 function updateQualityVisibility() {
@@ -352,14 +735,8 @@ async function convertImages() {
     return;
   }
 
-  const options: ConversionOptions = {
-    format: formatSelect.value,
-    quality: parseInt(qualitySlider.value),
-    output_mode: outputMode,
-    output_folder: outputFolder,
-    // A disabled checkbox keeps its checked state, so gate on the format too.
-    preserve_metadata: preserveMetadataCheckbox.checked && !preserveMetadataCheckbox.disabled,
-  };
+  // Same builder the estimate uses, so what was previewed is what gets converted.
+  const options = currentOptions();
 
   const paths = selectedImages.map((img) => img.path);
 
@@ -374,7 +751,10 @@ async function convertImages() {
       showStatus(`Successfully converted ${result.succeeded} image${result.succeeded > 1 ? "s" : ""}`, "success");
       selectedImages = [];
       outputFolder = null;
+      previewPath = null;
+      plannedSizes.clear();
       selectedFolderEl.textContent = "None selected";
+      estimateEl.textContent = "";
       updateUI();
     } else if (result.succeeded === 0) {
       const firstError = result.results.find((r) => r.error)?.error;
@@ -396,7 +776,10 @@ async function convertImages() {
 function clearSelection() {
   selectedImages = [];
   outputFolder = null;
+  previewPath = null;
+  plannedSizes.clear();
   selectedFolderEl.textContent = "None selected";
+  estimateEl.textContent = "";
   updateUI();
   showStatus("", "info");
 }
